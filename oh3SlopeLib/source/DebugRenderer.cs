@@ -12,6 +12,7 @@ namespace oh3SlopeLib
     public class SlopeDebugRenderer : IRenderer
     {
         private ICoreClientAPI capi;
+        private oh3SlopeLibModSystem modSys;
         private MeshRef cachedPlaneMeshRef;
 
         /// <summary>
@@ -19,18 +20,19 @@ namespace oh3SlopeLib
         /// </summary>
         public bool IsActive { get; set; } = false;
 
-        public SlopeDebugRenderer(ICoreClientAPI capi, string hexColor)
+        public SlopeDebugRenderer(ICoreClientAPI capi, oh3SlopeLibModSystem modSys)
         {
             this.capi = capi;
-            BuildGlowingPlaneMesh(1.5f, hexColor);
+            this.modSys = modSys;
+            BuildGlowingPlaneMesh(1.5f);
         }
 
         /// <summary>
         /// 1. Initialization (Build the Mesh Once)
         /// </summary>
-        private void BuildGlowingPlaneMesh(float size, string hexColor)
+        private void BuildGlowingPlaneMesh(float size)
         {
-            // Capacity: 5 vertices, 10 indices. Include UVs and Normals for Standard shader compatibility.
+            // Capacity: 5 vertices, 10 indices. Standard shader requires UVs, Normals, and Flags.
             MeshData mesh = new MeshData(5, 10, true, true, true, true);
             mesh.SetMode(EnumDrawMode.Lines);
 
@@ -42,9 +44,11 @@ namespace oh3SlopeLib
                 -0.5f, 0,  0.5f,
                  0, size, 0
             };
+            mesh.VerticesCount = 5;
+
             mesh.Uv = new float[10];
             mesh.Normals = new int[5];
-            mesh.VerticesCount = 5;
+            mesh.Flags = new int[5];
 
             // Indices: 8 to draw the perimeter of the quad, 2 to draw the line from center to tip
             mesh.Indices = new int[] {
@@ -53,33 +57,19 @@ namespace oh3SlopeLib
             };
             mesh.IndicesCount = 10;
 
-            byte r = 0, g = 255, b = 255, a = 255;
-            try
+            // Standard shader expects the mesh to be white, and tinted via RgbaTint later
+            mesh.Rgba = new byte[20];
+            for (int i = 0; i < 5; i++)
             {
-                string hex = hexColor?.TrimStart('#') ?? "00FFFF";
-                if (hex.Length >= 6)
-                {
-                    r = byte.Parse(hex.Substring(0, 2), System.Globalization.NumberStyles.HexNumber);
-                    g = byte.Parse(hex.Substring(2, 2), System.Globalization.NumberStyles.HexNumber);
-                    b = byte.Parse(hex.Substring(4, 2), System.Globalization.NumberStyles.HexNumber);
-                    if (hex.Length == 8) a = byte.Parse(hex.Substring(6, 2), System.Globalization.NumberStyles.HexNumber);
-                }
+                mesh.Rgba[i * 4 + 0] = 255;
+                mesh.Rgba[i * 4 + 1] = 255;
+                mesh.Rgba[i * 4 + 2] = 255;
+                mesh.Rgba[i * 4 + 3] = 255;
+                mesh.Uv[i * 2 + 0] = 0.5f;
+                mesh.Uv[i * 2 + 1] = 0.5f;
+                mesh.Normals[i] = 0;
+                mesh.Flags[i] = 0;
             }
-            catch { /* Keep default cyan on parse failure */ }
-
-            // Colors: 4 bytes per vertex (RGBA)
-            mesh.Rgba = new byte[] {
-                r, g, b, a, // Base 1
-                r, g, b, a, // Base 2
-                r, g, b, a, // Base 3
-                r, g, b, a, // Base 4
-                255, 255, 255, 255  // Tip (White)
-            };
-
-            // Glow: Iterate through the mesh.Flags array and set each to max brightness
-            mesh.Flags = new int[] {
-                128 << 12, 128 << 12, 128 << 12, 128 << 12, 128 << 12
-            };
 
             cachedPlaneMeshRef = capi.Render.UploadMesh(mesh);
         }
@@ -104,13 +94,22 @@ namespace oh3SlopeLib
             // Abort early if the debug view is toggled off
             if (!IsActive || cachedPlaneMeshRef == null) return;
 
-            // Use the strongly typed StandardShader to avoid KeyNotFoundExceptions
+            // Use StandardShader matching the working example
             IStandardShaderProgram prog = capi.Render.StandardShader;
+            if (prog == null) return;
+
             prog.Use();
-            prog.RgbaTint = new Vec4f(1, 1, 1, 1);
+            prog.DontWarpVertices = 1;
+
+            // Mimic the exact lighting and coloring logic that worked in the previous mod
+            prog.RgbaTint = modSys.DebugColorVec;
+            prog.RgbaLightIn = new Vec4f(1f, 1f, 1f, 1f);
+            prog.RgbaAmbientIn = new Vec3f(1f, 1f, 1f);
             prog.ExtraGlow = 255;
             prog.ProjectionMatrix = capi.Render.CurrentProjectionMatrix;
             prog.ViewMatrix = capi.Render.CameraMatrixOriginf;
+
+            Vec3d camPos = capi.World.Player.Entity.CameraPos;
 
             foreach (var entity in capi.World.LoadedEntities.Values)
             {
@@ -138,7 +137,6 @@ namespace oh3SlopeLib
                 float[] modelMatrix = Mat4f.Create();
 
                 // 4. Position relative to camera
-                Vec3d camPos = capi.World.Player.Entity.CameraPos;
                 Mat4f.Translate(modelMatrix, modelMatrix, (float)(pos.X - camPos.X), (float)(pos.Y - camPos.Y), (float)(pos.Z - camPos.Z));
 
                 // Apply the calculated rotation to our custom ModelMatrix

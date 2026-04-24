@@ -1,6 +1,7 @@
 ﻿using Vintagestory.API.Common;
 using Vintagestory.API.Server;
 using Vintagestory.API.Client;
+using Vintagestory.API.MathTools;
 
 namespace oh3SlopeLib
 {
@@ -17,6 +18,9 @@ namespace oh3SlopeLib
 
         public SlopeLibServerConfig ServerConfig { get; private set; }
         public SlopeLibClientConfig ClientConfig { get; private set; }
+
+        // Stores the parsed config color for the shader to use
+        public Vec4f DebugColorVec { get; private set; } = new Vec4f(0f, 1f, 1f, 1f);
 
         public override void Start(ICoreAPI api)
         {
@@ -67,7 +71,10 @@ namespace oh3SlopeLib
                 api.Logger.Error("Failed to load client config! Falling back to default settings. Error: {0}", e);
             }
 
-            debugRenderer = new SlopeDebugRenderer(api, ClientConfig.DebugColor);
+            ParseDebugColor();
+
+            // Pass the ModSystem itself so the renderer can access DebugColorVec
+            debugRenderer = new SlopeDebugRenderer(api, this);
             api.Event.RegisterRenderer(debugRenderer, EnumRenderStage.Opaque, "slopedebug");
 
             // Register the client-side chat command
@@ -77,6 +84,23 @@ namespace oh3SlopeLib
                     .WithDescription("Toggles the slope engine debug visualizer")
                     .HandleWith(OnToggleDebug)
                 .EndSubCommand();
+        }
+
+        private void ParseDebugColor()
+        {
+            string hex = ClientConfig?.DebugColor?.TrimStart('#') ?? "00FFFF";
+            if (hex.Length >= 6)
+            {
+                try
+                {
+                    float r = int.Parse(hex.Substring(0, 2), System.Globalization.NumberStyles.HexNumber) / 255f;
+                    float g = int.Parse(hex.Substring(2, 2), System.Globalization.NumberStyles.HexNumber) / 255f;
+                    float b = int.Parse(hex.Substring(4, 2), System.Globalization.NumberStyles.HexNumber) / 255f;
+                    float a = hex.Length == 8 ? int.Parse(hex.Substring(6, 2), System.Globalization.NumberStyles.HexNumber) / 255f : 1f;
+                    DebugColorVec = new Vec4f(r, g, b, a);
+                }
+                catch { /* Keep default cyan on parse failure */ }
+            }
         }
 
         private TextCommandResult OnToggleDebug(TextCommandCallingArgs args)
