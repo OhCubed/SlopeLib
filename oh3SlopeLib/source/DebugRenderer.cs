@@ -15,6 +15,12 @@ namespace oh3SlopeLib
         private oh3SlopeLibModSystem modSys;
         private MeshRef cachedPlaneMeshRef;
 
+        // --- Pre-allocated memory buffers to prevent Garbage Collection spikes ---
+        private float[] modelMatrix = Mat4f.Create();
+        private float[] rotationAxis = new float[3];
+        private Vec4f overrideLight = new Vec4f(1f, 1f, 1f, 1f);
+        private Vec3f overrideAmbient = new Vec3f(1f, 1f, 1f);
+
         /// <summary>
         /// Controls whether the debug visuals are actively drawn.
         /// </summary>
@@ -32,34 +38,35 @@ namespace oh3SlopeLib
         /// </summary>
         private void BuildGlowingPlaneMesh(float size)
         {
-            // Capacity: 5 vertices, 10 indices. Standard shader requires UVs, Normals, and Flags.
-            MeshData mesh = new MeshData(5, 10, true, true, true, true);
+            // Capacity: 6 vertices, 10 indices. Standard shader requires UVs, Normals, and Flags.
+            MeshData mesh = new MeshData(6, 10, true, true, true, true);
             mesh.SetMode(EnumDrawMode.Lines);
 
-            // Vertices: 4 form a flat quad on the X/Z axis at Y=0, 1 sits at (0, size, 0)
+            // Vertices: 4 form a flat quad on the X/Z axis at Y=0, 1 sits at (0, size, 0), 1 sits at center (0, 0, 0)
             mesh.xyz = new float[] {
-                -0.5f, 0, -0.5f,
-                 0.5f, 0, -0.5f,
-                 0.5f, 0,  0.5f,
-                -0.5f, 0,  0.5f,
-                 0, size, 0
+                -0.5f, 0, -0.5f, // 0
+                 0.5f, 0, -0.5f, // 1
+                 0.5f, 0,  0.5f, // 2
+                -0.5f, 0,  0.5f, // 3
+                 0, size, 0,     // 4 (Tip)
+                 0, 0, 0         // 5 (Center)
             };
-            mesh.VerticesCount = 5;
+            mesh.VerticesCount = 6;
 
-            mesh.Uv = new float[10];
-            mesh.Normals = new int[5];
-            mesh.Flags = new int[5];
+            mesh.Uv = new float[12];
+            mesh.Normals = new int[6];
+            mesh.Flags = new int[6];
 
             // Indices: 8 to draw the perimeter of the quad, 2 to draw the line from center to tip
             mesh.Indices = new int[] {
                 0, 1, 1, 2, 2, 3, 3, 0,
-                0, 4, 2, 4
+                5, 4
             };
             mesh.IndicesCount = 10;
 
             // Standard shader expects the mesh to be white, and tinted via RgbaTint later
-            mesh.Rgba = new byte[20];
-            for (int i = 0; i < 5; i++)
+            mesh.Rgba = new byte[24];
+            for (int i = 0; i < 6; i++)
             {
                 mesh.Rgba[i * 4 + 0] = 255;
                 mesh.Rgba[i * 4 + 1] = 255;
@@ -103,8 +110,8 @@ namespace oh3SlopeLib
 
             // Mimic the exact lighting and coloring logic that worked in the previous mod
             prog.RgbaTint = modSys.DebugColorVec;
-            prog.RgbaLightIn = new Vec4f(1f, 1f, 1f, 1f);
-            prog.RgbaAmbientIn = new Vec3f(1f, 1f, 1f);
+            prog.RgbaLightIn = overrideLight;
+            prog.RgbaAmbientIn = overrideAmbient;
             prog.ExtraGlow = 255;
             prog.ProjectionMatrix = capi.Render.CurrentProjectionMatrix;
             prog.ViewMatrix = capi.Render.CameraMatrixOriginf;
@@ -120,21 +127,24 @@ namespace oh3SlopeLib
                 Vec3d normal = tracker.SurfaceNormal;
                 Vec3d pos = entity.Pos.XYZ;
 
-                // 2. Calculate rotation from standard "Up" to our normal (Using Axis-Angle)
-                Vec3f up = new Vec3f(0, 1, 0);
-                Vec3f n = normal.ToVec3f();
+                // 2. Highly optimized cross product and dot product assuming 'Up' is always exactly (0, 1, 0)
+                // This avoids allocating Vec3f objects or arrays every frame
+                float nX = (float)normal.X;
+                float nY = (float)normal.Y;
+                float nZ = (float)normal.Z;
 
-                float[] axis = new float[] {
-                    up.Y * n.Z - up.Z * n.Y,
-                    up.Z * n.X - up.X * n.Z,
-                    up.X * n.Y - up.Y * n.X
-                };
-                float len = (float)Math.Sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
-                float dot = up.X * n.X + up.Y * n.Y + up.Z * n.Z;
+                rotationAxis[0] = nZ;
+                rotationAxis[1] = 0;
+                rotationAxis[2] = -nX;
+
+                float lenSq = rotationAxis[0] * rotationAxis[0] + rotationAxis[2] * rotationAxis[2];
+                float len = lenSq > 0 ? (float)Math.Sqrt(lenSq) : 0;
+
+                float dot = nY;
                 float angle = (float)Math.Acos(GameMath.Clamp(dot, -1f, 1f));
 
-                // 3. Render Setup
-                float[] modelMatrix = Mat4f.Create();
+                // 3. Render Setup - Re-use the existing model matrix buffer
+                Mat4f.Identity(modelMatrix);
 
                 // 4. Position relative to camera
                 Mat4f.Translate(modelMatrix, modelMatrix, (float)(pos.X - camPos.X), (float)(pos.Y - camPos.Y), (float)(pos.Z - camPos.Z));
@@ -142,15 +152,17 @@ namespace oh3SlopeLib
                 // Apply the calculated rotation to our custom ModelMatrix
                 if (len > 0.0001f)
                 {
-                    axis[0] /= len;
-                    axis[1] /= len;
-                    axis[2] /= len;
-                    Mat4f.Rotate(modelMatrix, modelMatrix, angle, axis);
+                    rotationAxis[0] /= len;
+                    rotationAxis[2] /= len;
+                    Mat4f.Rotate(modelMatrix, modelMatrix, angle, rotationAxis);
                 }
                 else if (dot < 0)
                 {
                     // Fallback for looking straight down
-                    Mat4f.Rotate(modelMatrix, modelMatrix, (float)Math.PI, new float[] { 1, 0, 0 });
+                    rotationAxis[0] = 1;
+                    rotationAxis[1] = 0;
+                    rotationAxis[2] = 0;
+                    Mat4f.Rotate(modelMatrix, modelMatrix, (float)Math.PI, rotationAxis);
                 }
 
                 // 5. Draw and Cleanup

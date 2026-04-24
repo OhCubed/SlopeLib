@@ -13,7 +13,7 @@ namespace oh3SlopeLib
     public class EntityBehaviorSlopeAware : EntityBehavior
     {
         /// <summary>
-        /// The smoothly interpolated normal of the surface below the entity.
+        /// The smoothly interpolated normal of the surface nearest to the entity.
         /// </summary>
         public Vec3d SurfaceNormal { get; private set; } = new Vec3d(0, 1, 0);
 
@@ -23,13 +23,12 @@ namespace oh3SlopeLib
         public double DistanceToSurface { get; private set; } = 9999.0;
 
         /// <summary>
-        /// If true, bypasses WalkBlocks and uses a basic raycast to determine the floor.
+        /// If true, bypasses volumetric logic and uses a basic downward raycast.
         /// </summary>
         public bool UseFastPathFloorOnly = false;
 
         private Vec3d lastSampledPos = new Vec3d(0, -9999, 0);
         private const double SampleThresholdSq = 0.1 * 0.1;
-        private const double SampleRadius = 1.5;
 
         public EntityBehaviorSlopeAware(Entity entity) : base(entity)
         {
@@ -70,77 +69,126 @@ namespace oh3SlopeLib
         }
 
         /// <summary>
-        /// Core Algorithm: Distance-Weighted Normals
-        /// Samples the local 3D grid and builds a continuous surface normal from nearby collision boxes.
+        /// Core Algorithm: Averaged Exposed Faces
+        /// Uses WalkBlocks to gather all collision boxes, culls internal hidden faces, and averages 
+        /// the pure geometric normals of the exposed surfaces. This completely eliminates grid bias 
+        /// while beautifully smoothing out stairs and voxel terrain into natural slopes!
         /// </summary>
         private void UpdateSurfaceData()
         {
             Cuboidf selBox = entity.SelectionBox ?? new Cuboidf(-0.5f, 0, -0.5f, 0.5f, 1f, 0.5f);
 
-            // Focus our sampling center slightly above the bottom of the bounding box
-            Vec3d center = entity.Pos.XYZ.Clone();
-            center.Y += selBox.Y2 / 2.0;
+            // We evaluate from the center of the entity to prevent division-by-zero 
+            // when standing exactly on a face, and to "see" walls around us equally.
+            Vec3d center = new Vec3d(
+                entity.Pos.X,
+                entity.Pos.Y + selBox.YSize / 2.0,
+                entity.Pos.Z
+            );
 
-            // Expand a sample boundary box
-            Cuboidd bounds = selBox.ToDouble().Translate(entity.Pos.XYZ);
-            bounds.GrowBy(SampleRadius, SampleRadius, SampleRadius);
+            // Define the local grid area to sample (Entity footprint + 1 block margin)
+            int minX = (int)Math.Floor(center.X - selBox.XSize / 2.0 - 1.0);
+            int minY = (int)Math.Floor(center.Y - selBox.YSize / 2.0 - 1.0);
+            int minZ = (int)Math.Floor(center.Z - selBox.ZSize / 2.0 - 1.0);
 
-            BlockPos minPos = new BlockPos((int)Math.Floor(bounds.X1), (int)Math.Floor(bounds.Y1), (int)Math.Floor(bounds.Z1));
-            BlockPos maxPos = new BlockPos((int)Math.Ceiling(bounds.X2), (int)Math.Ceiling(bounds.Y2), (int)Math.Ceiling(bounds.Z2));
+            int maxX = (int)Math.Ceiling(center.X + selBox.XSize / 2.0 + 1.0);
+            int maxY = (int)Math.Ceiling(center.Y + selBox.YSize / 2.0 + 1.0);
+            int maxZ = (int)Math.Ceiling(center.Z + selBox.ZSize / 2.0 + 1.0);
 
-            Vec3d normalSum = new Vec3d();
-            double closestDist = 9999.0;
+            BlockPos minPos = new BlockPos(minX, minY, minZ);
+            BlockPos maxPos = new BlockPos(maxX, maxY, maxZ);
 
-            // Highly optimized iteration through local grid
-            entity.World.BlockAccessor.WalkBlocks(minPos, maxPos, (block, x, y, z) =>
+            Vec3d averageNormal = new Vec3d(0, 0, 0);
+            double minDistanceSq = 9999.0;
+            int facesSampled = 0;
+
+            BlockFacing[] facings = BlockFacing.ALLFACES;
+
+            // 1. Efficiently query the engine for all blocks within the 3D area
+            entity.World.BlockAccessor.WalkBlocks(minPos, maxPos, (block, bx, by, bz) =>
             {
                 if (block.Id == 0) return;
 
-                Cuboidf[] collisionBoxes = block.GetCollisionBoxes(entity.World.BlockAccessor, new BlockPos(x, y, z));
-                if (collisionBoxes == null || collisionBoxes.Length == 0) return;
+                Cuboidf[] boxes = block.GetCollisionBoxes(entity.World.BlockAccessor, new BlockPos(bx, by, bz));
+                if (boxes == null || boxes.Length == 0) return;
 
-                foreach (var box in collisionBoxes)
+                foreach (var box in boxes)
                 {
-                    Cuboidd worldBox = box.ToDouble().Translate(x, y, z);
+                    double worldX1 = bx + box.X1; double worldY1 = by + box.Y1; double worldZ1 = bz + box.Z1;
+                    double worldX2 = bx + box.X2; double worldY2 = by + box.Y2; double worldZ2 = bz + box.Z2;
 
-                    // Find the mathematically closest point on this block's collision box to the entity's center
-                    double cx = GameMath.Clamp(center.X, worldBox.X1, worldBox.X2);
-                    double cy = GameMath.Clamp(center.Y, worldBox.Y1, worldBox.Y2);
-                    double cz = GameMath.Clamp(center.Z, worldBox.Z1, worldBox.Z2);
-
-                    // Create a normal vector pointing from the closest surface point back to the entity
-                    Vec3d pointToCenter = new Vec3d(center.X - cx, center.Y - cy, center.Z - cz);
-                    double dist = pointToCenter.Length();
-
-                    closestDist = Math.Min(closestDist, dist);
-
-                    if (dist > 0.001)
+                    foreach (BlockFacing facing in facings)
                     {
-                        // Weighting: Inverse distance (Closer blocks pull the normal more aggressively)
-                        double weight = 1.0 / dist;
-                        pointToCenter.Normalize();
-                        normalSum.Add(pointToCenter.X * weight, pointToCenter.Y * weight, pointToCenter.Z * weight);
-                    }
-                    else
-                    {
-                        // The entity center is exactly inside or perfectly on the collision box bounds
-                        // Push up strongly to correct the overlap
-                        normalSum.Add(0, 1000.0, 0);
+                        // 2. Cull internal faces! This is what entirely eliminates the South-East bias.
+                        // If a block face is pressed against another solid block, it doesn't push the player.
+                        bool isExposed = true;
+
+                        if (facing == BlockFacing.UP && box.Y2 >= 0.999f)
+                            isExposed = !entity.World.BlockAccessor.GetBlock(bx, by + 1, bz).SideSolid[BlockFacing.DOWN.Index];
+                        else if (facing == BlockFacing.DOWN && box.Y1 <= 0.001f)
+                            isExposed = !entity.World.BlockAccessor.GetBlock(bx, by - 1, bz).SideSolid[BlockFacing.UP.Index];
+                        else if (facing == BlockFacing.NORTH && box.Z1 <= 0.001f)
+                            isExposed = !entity.World.BlockAccessor.GetBlock(bx, by, bz - 1).SideSolid[BlockFacing.SOUTH.Index];
+                        else if (facing == BlockFacing.SOUTH && box.Z2 >= 0.999f)
+                            isExposed = !entity.World.BlockAccessor.GetBlock(bx, by, bz + 1).SideSolid[BlockFacing.NORTH.Index];
+                        else if (facing == BlockFacing.WEST && box.X1 <= 0.001f)
+                            isExposed = !entity.World.BlockAccessor.GetBlock(bx - 1, by, bz).SideSolid[BlockFacing.EAST.Index];
+                        else if (facing == BlockFacing.EAST && box.X2 >= 0.999f)
+                            isExposed = !entity.World.BlockAccessor.GetBlock(bx + 1, by, bz).SideSolid[BlockFacing.WEST.Index];
+
+                        if (!isExposed) continue;
+
+                        // 3. Find the mathematically closest point on this specific flat face
+                        double pX = GameMath.Clamp(center.X, worldX1, worldX2);
+                        double pY = GameMath.Clamp(center.Y, worldY1, worldY2);
+                        double pZ = GameMath.Clamp(center.Z, worldZ1, worldZ2);
+
+                        // Snap to the plane of the face
+                        if (facing == BlockFacing.UP) pY = worldY2;
+                        else if (facing == BlockFacing.DOWN) pY = worldY1;
+                        else if (facing == BlockFacing.NORTH) pZ = worldZ1;
+                        else if (facing == BlockFacing.SOUTH) pZ = worldZ2;
+                        else if (facing == BlockFacing.WEST) pX = worldX1;
+                        else if (facing == BlockFacing.EAST) pX = worldX2;
+
+                        // 4. Calculate distance and direction
+                        double dirX = center.X - pX;
+                        double dirY = center.Y - pY;
+                        double dirZ = center.Z - pZ;
+
+                        // 5. We only care about surfaces facing TOWARDS the player's center
+                        // Dot product > 0 ensures we aren't looking at the backside of a polygon
+                        double dot = dirX * facing.Normali.X + dirY * facing.Normali.Y + dirZ * facing.Normali.Z;
+                        if (dot <= 0.0001) continue;
+
+                        double distSq = dirX * dirX + dirY * dirY + dirZ * dirZ;
+                        minDistanceSq = Math.Min(minDistanceSq, distSq);
+
+                        // 6. Weight the *pure geometric normal* by proximity
+                        // Cap the min distance to prevent infinity/massive spikes if clipping inside a block
+                        double weight = 1.0 / Math.Max(0.01, distSq);
+
+                        averageNormal.Add(
+                            facing.Normali.X * weight,
+                            facing.Normali.Y * weight,
+                            facing.Normali.Z * weight
+                        );
+                        facesSampled++;
                     }
                 }
             });
 
-            DistanceToSurface = closestDist;
-
-            if (normalSum.LengthSq() > 0)
+            // 7. Average them all out into a perfectly smooth plane
+            if (facesSampled > 0 && averageNormal.LengthSq() > 0.001)
             {
-                // Smoothly combines the weighted influence of all nearby collision steps
-                SurfaceNormal = normalSum.Normalize();
+                SurfaceNormal = averageNormal.Normalize();
+                DistanceToSurface = Math.Max(0.0, Math.Sqrt(minDistanceSq) - selBox.YSize / 2.0);
             }
             else
             {
-                // Default to a flat plane if floating far away from everything
+                // Fallback for open air
                 SurfaceNormal = new Vec3d(0, 1, 0);
+                DistanceToSurface = 9999.0;
             }
         }
 
@@ -153,7 +201,6 @@ namespace oh3SlopeLib
             EntitySelection entitySel = new EntitySelection();
             Vec3d pos = entity.Pos.XYZ;
 
-            // Simple ray trace straight down
             entity.World.RayTraceForSelection(pos, pos.AddCopy(0, -2, 0), ref blockSel, ref entitySel);
 
             if (blockSel != null && blockSel.Position != null)
