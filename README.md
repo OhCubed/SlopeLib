@@ -1,14 +1,14 @@
 SlopeLib
 
-High-performance entity behavior for Vintage Story providing smooth surface normal interpolation and ground distance metrics via virtual collision sphere sampling.
+- High-performance entity behavior for Vintage Story providing smooth surface normal interpolation and ground distance metrics via virtual collision sphere sampling.
 
 Implementation
 
-Add the slopeaware behavior to the entity configuration. Configuration is defined within the slopelib attribute object.
+- Add the slopeaware behavior to the entity configuration. Configuration is defined within the slopelib attribute object.
 
 JSON Schema
 
-{
+`{
   "code": "mycustomentity",
   "class": "EntityAgent",
   "behaviors": [
@@ -20,16 +20,14 @@ JSON Schema
       }
     }
   ]
-}
+}`
 
-
-diameter: Sphere diameter in blocks (Default: 1.0).
-
-yoffset: Vertical offset from entity base (Default: diameter / 2).
+- diameter: Sphere diameter in blocks (Default: 1.0).
+- yoffset: Vertical offset from entity base (Default: diameter / 2).
 
 Data Structure
 
-Access via entity.GetBehavior<EntityBehaviorSlopeAware>().
+- Access via entity.GetBehavior<EntityBehaviorSlopeAware>().
 
 Properties
 
@@ -41,6 +39,6 @@ Properties
 
 Debugging
 
-/slopelib debug: Toggle visualizer.
+`.slopelib debug`: Toggle visualizer.
 
-/slopelib debug [diameter] [yoffset]: Toggle visualizer with specific dimensional overrides for the player entity.
+`.slopelib debug [diameter] [yoffset]`: Toggle visualizer with specific dimensional overrides for the player entity's `diameter` and `yoffset` values.
