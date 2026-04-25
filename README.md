@@ -23,15 +23,15 @@ JSON Schema
 
 Data Structure
 
-- Access via entity.GetBehavior<EntityBehaviorSlopeAware>().
+- Access via `entity.GetBehavior<EntityBehaviorSlopeAware>().`
 
 Properties
 
-- SurfaceNormal (Vec3d): Normalized vector representing the interpolated surface orientation.
-- DistanceToSurface (double): Orthogonal distance from the sphere boundary to the resolved plane.
-- SurfacePoint (Vec3d): World coordinates of the sphere center projected onto the resolved plane.
-- CollisionSphereSize (double): Current diameter of the sampling sphere.
-- CollisionSphereYOffset (double): Current vertical offset of the sphere.
+- `SurfaceNormal` (Vec3d): Normalized vector representing the interpolated surface orientation.
+- `DistanceToSurface` (double): Orthogonal distance from the sphere boundary to the resolved plane.
+- `SurfacePoint` (Vec3d): World coordinates of the sphere center projected onto the resolved plane.
+- `CollisionSphereSize` (double): Current diameter of the sampling sphere.
+- `CollisionSphereYOffset` (double): Current vertical offset of the sphere.
 
 Debugging
 
