@@ -12,7 +12,6 @@ namespace oh3SlopeLib
     public sealed class oh3SlopeLibModSystem : ModSystem
     {
         // Reference to the API
-        private ICoreAPI api;
         private ICoreClientAPI capi;
         private SlopeDebugRenderer debugRenderer;
 
@@ -24,7 +23,6 @@ namespace oh3SlopeLib
 
         public override void Start(ICoreAPI api)
         {
-            this.api = api;
             base.Start(api);
 
             // Register blocks, items, entities, and behaviors here
@@ -37,12 +35,8 @@ namespace oh3SlopeLib
 
             try
             {
-                ServerConfig = api.LoadModConfig<SlopeLibServerConfig>("oh3SlopeLibServerConfig.json");
-                if (ServerConfig == null)
-                {
-                    ServerConfig = new SlopeLibServerConfig();
-                    api.StoreModConfig(ServerConfig, "oh3SlopeLibServerConfig.json");
-                }
+                ServerConfig = api.LoadModConfig<SlopeLibServerConfig>("oh3SlopeLibServerConfig.json") ?? new SlopeLibServerConfig();
+                api.StoreModConfig(ServerConfig, "oh3SlopeLibServerConfig.json");
             }
             catch (System.Exception e)
             {
@@ -58,12 +52,8 @@ namespace oh3SlopeLib
 
             try
             {
-                ClientConfig = api.LoadModConfig<SlopeLibClientConfig>("oh3SlopeLibClientConfig.json");
-                if (ClientConfig == null)
-                {
-                    ClientConfig = new SlopeLibClientConfig();
-                    api.StoreModConfig(ClientConfig, "oh3SlopeLibClientConfig.json");
-                }
+                ClientConfig = api.LoadModConfig<SlopeLibClientConfig>("oh3SlopeLibClientConfig.json") ?? new SlopeLibClientConfig();
+                api.StoreModConfig(ClientConfig, "oh3SlopeLibClientConfig.json");
             }
             catch (System.Exception e)
             {
@@ -77,11 +67,15 @@ namespace oh3SlopeLib
             debugRenderer = new SlopeDebugRenderer(api, this);
             api.Event.RegisterRenderer(debugRenderer, EnumRenderStage.Opaque, "slopedebug");
 
-            // Register the client-side chat command
+            // Register the client-side chat command using the new API
             api.ChatCommands.GetOrCreate("slopelib")
                 .WithDescription("SlopeLib client commands")
                 .BeginSubCommand("debug")
                     .WithDescription("Toggles the slope engine debug visualizer")
+                    .WithArgs(
+                        api.ChatCommands.Parsers.OptionalDouble("diameter", -9999.0),
+                        api.ChatCommands.Parsers.OptionalDouble("yoffset", -9999.0)
+                    )
                     .HandleWith(OnToggleDebug)
                 .EndSubCommand();
         }
@@ -107,16 +101,40 @@ namespace oh3SlopeLib
         {
             if (debugRenderer == null) return TextCommandResult.Error("Debug renderer is not initialized.");
 
-            debugRenderer.IsActive = !debugRenderer.IsActive;
+            // Safely cast the parsed objects. If the user doesn't enter anything, our -9999.0 defaults act as missing flags
+            double diameter = args[0] as double? ?? -9999.0;
+            double yoffset = args[1] as double? ?? -9999.0;
+            bool hasArgs = diameter > -9990.0;
+
+            // If the user provided arguments, force the debug view ON instead of toggling
+            if (hasArgs)
+            {
+                debugRenderer.IsActive = true;
+            }
+            else
+            {
+                debugRenderer.IsActive = !debugRenderer.IsActive;
+            }
+
             var playerEntity = capi.World.Player.Entity;
 
             if (debugRenderer.IsActive)
             {
                 // Attach the behavior to the player if they don't already have it
-                if (playerEntity.GetBehavior<EntityBehaviorSlopeAware>() == null)
+                var behavior = playerEntity.GetBehavior<EntityBehaviorSlopeAware>();
+                if (behavior == null)
                 {
-                    var behavior = new EntityBehaviorSlopeAware(playerEntity);
+                    behavior = new EntityBehaviorSlopeAware(playerEntity);
                     playerEntity.AddBehavior(behavior);
+                }
+
+                // If values were passed in the command, instantly apply them to the behavior!
+                if (hasArgs)
+                {
+                    behavior.CollisionSphereSize = diameter;
+                    behavior.CollisionSphereYOffset = yoffset > -9990.0 ? yoffset : (diameter / 2.0);
+
+                    return TextCommandResult.Success($"SlopeLib debug view is now ON (Diameter: {behavior.CollisionSphereSize}, Y-Offset: {behavior.CollisionSphereYOffset}).");
                 }
             }
             else
@@ -135,7 +153,11 @@ namespace oh3SlopeLib
         public override void Dispose()
         {
             base.Dispose();
-            // Cleanup logic if necessary
+
+            // CRITICAL OPTIMIZATION: We must dispose of our OpenGL MeshRef when the mod unloads 
+            // to prevent VRAM memory leaks every time the player disconnects and reconnects.
+            debugRenderer?.Dispose();
+            debugRenderer = null;
         }
     }
 }

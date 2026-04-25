@@ -98,8 +98,8 @@ namespace oh3SlopeLib
 
         public void OnRenderFrame(float deltaTime, EnumRenderStage stage)
         {
-            // Abort early if the debug view is toggled off
-            if (!IsActive || cachedPlaneMeshRef == null) return;
+            // Abort early if the debug view is toggled off, or if the player/world is currently loading/unloading
+            if (!IsActive || cachedPlaneMeshRef == null || capi?.World?.Player?.Entity == null) return;
 
             // Use StandardShader matching the working example
             IStandardShaderProgram prog = capi.Render.StandardShader;
@@ -118,57 +118,85 @@ namespace oh3SlopeLib
 
             Vec3d camPos = capi.World.Player.Entity.CameraPos;
 
-            foreach (var entity in capi.World.LoadedEntities.Values)
+            // CRITICAL OPTIMIZATION: Cache property getters outside the loop 
+            // so we aren't crossing into engine memory for every entity.
+            double camX = camPos.X;
+            double camY = camPos.Y;
+            double camZ = camPos.Z;
+
+            // Wrap the rendering in a try-catch to guarantee we NEVER crash the main game thread
+            try
             {
-                var tracker = entity.GetBehavior<EntityBehaviorSlopeAware>();
-                if (tracker == null) continue;
-
-                // 1. Get data from our tracker behavior
-                Vec3d normal = tracker.SurfaceNormal;
-                Vec3d pos = entity.Pos.XYZ;
-
-                // 2. Highly optimized cross product and dot product assuming 'Up' is always exactly (0, 1, 0)
-                // This avoids allocating Vec3f objects or arrays every frame
-                float nX = (float)normal.X;
-                float nY = (float)normal.Y;
-                float nZ = (float)normal.Z;
-
-                rotationAxis[0] = nZ;
-                rotationAxis[1] = 0;
-                rotationAxis[2] = -nX;
-
-                float lenSq = rotationAxis[0] * rotationAxis[0] + rotationAxis[2] * rotationAxis[2];
-                float len = lenSq > 0 ? (float)Math.Sqrt(lenSq) : 0;
-
-                float dot = nY;
-                float angle = (float)Math.Acos(GameMath.Clamp(dot, -1f, 1f));
-
-                // 3. Render Setup - Re-use the existing model matrix buffer
-                Mat4f.Identity(modelMatrix);
-
-                // 4. Position relative to camera
-                Mat4f.Translate(modelMatrix, modelMatrix, (float)(pos.X - camPos.X), (float)(pos.Y - camPos.Y), (float)(pos.Z - camPos.Z));
-
-                // Apply the calculated rotation to our custom ModelMatrix
-                if (len > 0.0001f)
+                // CRITICAL OPTIMIZATION: Iterate KeyValuePairs directly. Calling .Values on a ConcurrentDictionary 
+                // allocates a new array and ReadOnlyCollection every single frame, causing massive GC stutters!
+                foreach (var kvp in capi.World.LoadedEntities)
                 {
-                    rotationAxis[0] /= len;
-                    rotationAxis[2] /= len;
-                    Mat4f.Rotate(modelMatrix, modelMatrix, angle, rotationAxis);
-                }
-                else if (dot < 0)
-                {
-                    // Fallback for looking straight down
-                    rotationAxis[0] = 1;
-                    rotationAxis[1] = 0;
-                    rotationAxis[2] = 0;
-                    Mat4f.Rotate(modelMatrix, modelMatrix, (float)Math.PI, rotationAxis);
-                }
+                    var entity = kvp.Value;
 
-                // 5. Draw and Cleanup
-                prog.ModelMatrix = modelMatrix;
+                    // Skip null, dead, or despawning entities
+                    if (entity == null || !entity.Alive) continue;
 
-                capi.Render.RenderMesh(cachedPlaneMeshRef);
+                    var tracker = entity.GetBehavior<EntityBehaviorSlopeAware>();
+                    if (tracker == null) continue;
+
+                    // 1. Get data from our tracker behavior
+                    Vec3d normal = tracker.SurfaceNormal;
+                    Vec3d pos = tracker.SurfacePoint; // Use the exact surface intersection point
+
+                    // 2. Highly optimized cross product and dot product assuming 'Up' is always exactly (0, 1, 0)
+                    // This avoids allocating Vec3f objects or arrays every frame
+                    float nX = (float)normal.X;
+                    float nY = (float)normal.Y;
+                    float nZ = (float)normal.Z;
+
+                    // 3. Render Setup - Re-use the existing model matrix buffer and manually apply Identity + Translation.
+                    // This completely bypasses the Mat4f.Identity() and Mat4f.Translate() method invocation overhead!
+                    modelMatrix[0] = 1f; modelMatrix[1] = 0f; modelMatrix[2] = 0f; modelMatrix[3] = 0f;
+                    modelMatrix[4] = 0f; modelMatrix[5] = 1f; modelMatrix[6] = 0f; modelMatrix[7] = 0f;
+                    modelMatrix[8] = 0f; modelMatrix[9] = 0f; modelMatrix[10] = 1f; modelMatrix[11] = 0f;
+
+                    // 4. Position relative to camera
+                    modelMatrix[12] = (float)(pos.X - camX);
+                    modelMatrix[13] = (float)(pos.Y - camY);
+                    modelMatrix[14] = (float)(pos.Z - camZ);
+                    modelMatrix[15] = 1f;
+
+                    // Calculate rotation efficiently using locals instead of array lookups
+                    float lenSq = nZ * nZ + nX * nX;
+                    float len = lenSq > 0.000001f ? (float)Math.Sqrt(lenSq) : 0f;
+
+                    // Apply the calculated rotation to our custom ModelMatrix safely
+                    if (len > 0.0001f)
+                    {
+                        rotationAxis[0] = nZ / len;
+                        rotationAxis[1] = 0;
+                        rotationAxis[2] = -nX / len;
+
+                        // Manual inline clamp to bypass GameMath method overhead
+                        float dot = nY < -1f ? -1f : (nY > 1f ? 1f : nY);
+                        float angle = (float)Math.Acos(dot);
+
+                        Mat4f.Rotate(modelMatrix, modelMatrix, angle, rotationAxis);
+                    }
+                    else if (nY < -0.999f)
+                    {
+                        // Fallback only if pointing exactly straight down (nY == -1)
+                        rotationAxis[0] = 1;
+                        rotationAxis[1] = 0;
+                        rotationAxis[2] = 0;
+                        Mat4f.Rotate(modelMatrix, modelMatrix, (float)Math.PI, rotationAxis);
+                    }
+
+                    // 5. Draw and Cleanup
+                    prog.ModelMatrix = modelMatrix;
+
+                    capi.Render.RenderMesh(cachedPlaneMeshRef);
+                }
+            }
+            catch (Exception e)
+            {
+                // Graceful fallback if math or matrices ever go completely invalid
+                capi.Logger.VerboseDebug($"[SlopeLib] Suppressed error during debug render: {e.Message}");
             }
 
             prog.Stop();
