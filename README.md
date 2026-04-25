@@ -8,19 +8,15 @@ Implementation
 
 JSON Schema
 ```
-{
-  "code": "mycustomentity",
-  "class": "EntityAgent",
-  "behaviors": [
-    {
-      "code": "slopeaware",
-      "slopelib": {
-        "diameter": 1.0,
-        "yoffset": 0.5
-      }
+"behaviors": [
+  {
+    "code": "slopeaware",
+    "slopelib": {
+      "diameter": 1.0,
+      "yoffset": 0.5
     }
-  ]
-}
+  }
+]
 ```
 - diameter: Sphere diameter in blocks (Default: 1.0).
 - yoffset: Vertical offset from entity base (Default: diameter / 2).
