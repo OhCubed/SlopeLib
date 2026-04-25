@@ -23,7 +23,7 @@ JSON Schema
 
 Data Structure
 
-- Access via `entity.GetBehavior<EntityBehaviorSlopeAware>().`
+- Access via `entity.GetBehavior<EntityBehaviorSlopeAware>()`
 
 Properties
 
