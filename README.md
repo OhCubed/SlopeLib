@@ -7,8 +7,8 @@ Implementation
 - Add the slopeaware behavior to the entity configuration. Configuration is defined within the slopelib attribute object.
 
 JSON Schema
-
-`{
+```
+{
   "code": "mycustomentity",
   "class": "EntityAgent",
   "behaviors": [
@@ -20,8 +20,8 @@ JSON Schema
       }
     }
   ]
-}`
-
+}
+```
 - diameter: Sphere diameter in blocks (Default: 1.0).
 - yoffset: Vertical offset from entity base (Default: diameter / 2).
 
