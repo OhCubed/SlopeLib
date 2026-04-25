@@ -29,7 +29,7 @@ Properties
 
 - `SurfaceNormal` (Vec3d): Normalized vector representing the interpolated surface orientation.
 - `DistanceToSurface` (double): Orthogonal distance from the sphere boundary to the resolved plane.
-- `SurfacePoint` (Vec3d): World coordinates of the sphere center projected onto the resolved plane.
+- `SurfacePoint` (Vec3d): World coordinates of the point on the resolved terrain plane closest to the sphere center. Useful as a plane origin for physics.
 - `CollisionSphereSize` (double): Current diameter of the sampling sphere.
 - `CollisionSphereYOffset` (double): Current vertical offset of the sphere.
 
