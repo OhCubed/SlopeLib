@@ -1,11 +1,13 @@
-#SlopeLib
+SlopeLib
+
 High-performance entity behavior for Vintage Story providing smooth surface normal interpolation and ground distance metrics via virtual collision sphere sampling.
 
-#Implementation
+Implementation
+
 Add the `slopeaware` behavior to the entity configuration. Configuration is defined within the `slopelib` attribute object.
 To support complex multi-point physics (like a 4-wheeled vehicle), `slopelib` accepts an array of sphere definitions. (A single object is also supported for simple entities).
 
-#JSON Schema
+JSON Schema
 ```
 "behaviors": [
   {
@@ -27,12 +29,12 @@ To support complex multi-point physics (like a 4-wheeled vehicle), `slopelib` ac
 - `yoffset`: Vertical offset from entity base (Default: diameter / 2).
 - `zoffset`: Z-axis offset relative to the entity center (Default: 0.0).
 
-#Data Structure
+Data Structure
 
 Access the behavior on the active entity:
 `var slopeBehavior = entity.GetBehavior<EntityBehaviorSlopeAware>();`
 
-#Properties
+Properties
 
 `SurfaceDataList` (`SurfaceData[]`)
 - An array of objects representing the live state of every configured sampling sphere.
@@ -48,13 +50,15 @@ Each `TrackedSurface` object contains:
 - `DistanceToSurface` (`double`): Orthogonal distance from the sphere boundary to the resolved plane.
 - `SurfacePoint` (`Vec3d`): World coordinates of the point on the resolved terrain plane closest to the sphere center. Useful as a plane origin for physics calculations.
 
-#API Methods
+API Methods
+
 - `UpdateSphereConfig(int index, double size, double xOffset, double yOffset, double zOffset)`
 Dynamically mutates the geometric configuration of a specific sampling sphere in real-time. Designed to be called continuously from animation/physics loops without triggering Garbage Collection allocations.
 - `GetPhysicalSurfaceBlock(IBlockAccessor blockAccessor, Vec3d normal, double pX, double pY, double pZ, double maxDepth = 0.8)`
 Emulates a zero-allocation raycast along an inverted surface normal to find the physical block backing the mathematical plane. Natively resolves Microblock/Chiseled materials. Crucial for determining material types (e.g. ice, dirt) for friction mechanics.
 
-#Debugging
+Debugging
+
 - `.slopelib debug`
 Toggles the visualizer. Renders glowing planes representing all tracked distinct surface normals for all configured spheres, accompanied by a real-time tracking HUD.
 - `.slopelib debug [diameter] [yoffset]`
