@@ -162,8 +162,16 @@ namespace oh3SlopeLib
                 // Immediately apply explicit configurations to the active behavior instance.
                 if (hasArgs)
                 {
-                    behavior.CollisionSphereSize = diameter;
-                    behavior.CollisionSphereYOffset = yoffset > -9990.0 ? yoffset : (diameter / 2.0);
+                    if (behavior.SurfaceDataList != null && behavior.SurfaceDataList.Length > 0)
+                    {
+                        behavior.UpdateSphereConfig(
+                            0,
+                            diameter,
+                            behavior.SurfaceDataList[0].CollisionSphereXOffset,
+                            yoffset > -9990.0 ? yoffset : (diameter / 2.0),
+                            behavior.SurfaceDataList[0].CollisionSphereZOffset
+                        );
+                    }
                 }
 
                 // Mount the real-time HUD logger
@@ -172,7 +180,7 @@ namespace oh3SlopeLib
 
                 if (hasArgs)
                 {
-                    return TextCommandResult.Success($"SlopeLib debug view is now ON (Diameter: {behavior.CollisionSphereSize}, Y-Offset: {behavior.CollisionSphereYOffset}).");
+                    return TextCommandResult.Success($"SlopeLib debug view is now ON (Diameter: {behavior.SurfaceDataList[0].CollisionSphereSize}, Y-Offset: {behavior.SurfaceDataList[0].CollisionSphereYOffset}).");
                 }
             }
             else

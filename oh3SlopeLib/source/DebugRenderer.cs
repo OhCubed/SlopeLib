@@ -21,6 +21,9 @@ namespace oh3SlopeLib
         private Vec4f overrideLight = new Vec4f(1f, 1f, 1f, 1f);
         private Vec3f overrideAmbient = new Vec3f(1f, 1f, 1f);
 
+        // --- Error state tracking to gracefully degrade without spamming logs ---
+        private int consecutiveErrors = 0;
+
         /// <summary>
         /// Gets or sets a value indicating whether the debug visuals should be rendered this frame.
         /// </summary>
@@ -44,6 +47,9 @@ namespace oh3SlopeLib
         /// <param name="size">The length of the directional normal indicator.</param>
         private void BuildGlowingPlaneMesh(float size)
         {
+            // Ensure any existing mesh is disposed of to prevent VRAM memory leaks
+            cachedPlaneMeshRef?.Dispose();
+
             // Capacity: 6 vertices, 10 indices. The standard shader requires UVs, Normals, and Flags.
             MeshData mesh = new MeshData(6, 10, true, true, true, true);
             mesh.SetMode(EnumDrawMode.Lines);
@@ -134,8 +140,8 @@ namespace oh3SlopeLib
             double camY = camPos.Y;
             double camZ = camPos.Z;
 
-            // Wrap rendering logic in a try-catch block to prevent localized math exceptions 
-            // from cascading and disrupting the client render thread.
+            // Wrap rendering logic in a try-catch-finally block to prevent localized math exceptions 
+            // from cascading, while guaranteeing the shader always unbinds safely.
             try
             {
                 // OPTIMIZATION: Iterate the ConcurrentDictionary via KeyValuePair. Calling .Values 
@@ -147,67 +153,96 @@ namespace oh3SlopeLib
                     if (entity == null || !entity.Alive) continue;
 
                     var tracker = entity.GetBehavior<EntityBehaviorSlopeAware>();
-                    if (tracker == null) continue;
 
-                    // Retrieve calculated surface data from the slope behavior.
-                    Vec3d normal = tracker.SurfaceNormal;
-                    Vec3d pos = tracker.SurfacePoint;
+                    // Null-guards protect against partially initialized entities during chunk loading edges
+                    if (tracker?.SurfaceDataList == null) continue;
 
-                    // OPTIMIZATION: Cast components explicitly to avoid creating temporary Vec3f objects.
-                    float nX = (float)normal.X;
-                    float nY = (float)normal.Y;
-                    float nZ = (float)normal.Z;
-
-                    // Initialize the pre-allocated model matrix buffer with a pristine identity state.
-                    // This manual assignment bypasses the method invocation overhead of Mat4f.Identity().
-                    modelMatrix[0] = 1f; modelMatrix[1] = 0f; modelMatrix[2] = 0f; modelMatrix[3] = 0f;
-                    modelMatrix[4] = 0f; modelMatrix[5] = 1f; modelMatrix[6] = 0f; modelMatrix[7] = 0f;
-                    modelMatrix[8] = 0f; modelMatrix[9] = 0f; modelMatrix[10] = 1f; modelMatrix[11] = 0f;
-
-                    // Apply translation relative to the camera's current viewport.
-                    modelMatrix[12] = (float)(pos.X - camX);
-                    modelMatrix[13] = (float)(pos.Y - camY);
-                    modelMatrix[14] = (float)(pos.Z - camZ);
-                    modelMatrix[15] = 1f;
-
-                    // Determine the axis of rotation using an optimized, inline cross-product.
-                    // This assumes the global 'Up' vector is constantly (0, 1, 0).
-                    float lenSq = nZ * nZ + nX * nX;
-                    float len = lenSq > 0.000001f ? (float)Math.Sqrt(lenSq) : 0f;
-
-                    if (len > 0.0001f)
+                    for (int s = 0; s < tracker.SurfaceDataList.Length; s++)
                     {
-                        rotationAxis[0] = nZ / len;
-                        rotationAxis[1] = 0;
-                        rotationAxis[2] = -nX / len;
+                        var sd = tracker.SurfaceDataList[s];
+                        if (sd?.Surfaces == null) continue;
 
-                        // Inline clamp to mathematically guarantee the dot product rests between -1 and 1.
-                        // This entirely removes the risk of Math.Acos returning a NaN.
-                        float dot = nY < -1f ? -1f : (nY > 1f ? 1f : nY);
-                        float angle = (float)Math.Acos(dot);
+                        for (int i = 0; i < sd.Surfaces.Length; i++)
+                        {
+                            var surf = sd.Surfaces[i];
 
-                        Mat4f.Rotate(modelMatrix, modelMatrix, angle, rotationAxis);
+                            // Skip rendering uninitialized, null, or empty surface slots
+                            if (surf == null || surf.DistanceToSurface > 9990.0) continue;
+
+                            Vec3d normal = surf.SurfaceNormal;
+                            Vec3d pos = surf.SurfacePoint;
+
+                            if (normal == null || pos == null) continue;
+
+                            // OPTIMIZATION: Cast components explicitly to avoid creating temporary Vec3f objects.
+                            float nX = (float)normal.X;
+                            float nY = (float)normal.Y;
+                            float nZ = (float)normal.Z;
+
+                            // Shrink lower-priority trailing planes slightly so they are visually distinguishable
+                            float visualScale = 1f - (i * 0.15f);
+
+                            // Initialize the pre-allocated model matrix buffer with a scaled pristine identity state.
+                            modelMatrix[0] = visualScale; modelMatrix[1] = 0f; modelMatrix[2] = 0f; modelMatrix[3] = 0f;
+                            modelMatrix[4] = 0f; modelMatrix[5] = visualScale; modelMatrix[6] = 0f; modelMatrix[7] = 0f;
+                            modelMatrix[8] = 0f; modelMatrix[9] = 0f; modelMatrix[10] = visualScale; modelMatrix[11] = 0f;
+
+                            // Apply translation relative to the camera's current viewport.
+                            modelMatrix[12] = (float)(pos.X - camX);
+                            modelMatrix[13] = (float)(pos.Y - camY);
+                            modelMatrix[14] = (float)(pos.Z - camZ);
+                            modelMatrix[15] = 1f;
+
+                            // Determine the axis of rotation using an optimized, inline cross-product.
+                            // This assumes the global 'Up' vector is constantly (0, 1, 0).
+                            float lenSq = nZ * nZ + nX * nX;
+                            float len = lenSq > 0.000001f ? (float)Math.Sqrt(lenSq) : 0f;
+
+                            if (len > 0.0001f)
+                            {
+                                rotationAxis[0] = nZ / len;
+                                rotationAxis[1] = 0;
+                                rotationAxis[2] = -nX / len;
+
+                                // Inline clamp to mathematically guarantee the dot product rests between -1 and 1.
+                                float dot = nY < -1f ? -1f : (nY > 1f ? 1f : nY);
+                                float angle = (float)Math.Acos(dot);
+
+                                Mat4f.Rotate(modelMatrix, modelMatrix, angle, rotationAxis);
+                            }
+                            else if (nY < -0.999f)
+                            {
+                                // Handle the edge case where the surface normal points exactly downwards.
+                                rotationAxis[0] = 1;
+                                rotationAxis[1] = 0;
+                                rotationAxis[2] = 0;
+                                Mat4f.Rotate(modelMatrix, modelMatrix, (float)Math.PI, rotationAxis);
+                            }
+
+                            // Upload the final transformation matrix to the shader and execute the draw call.
+                            prog.ModelMatrix = modelMatrix;
+                            capi.Render.RenderMesh(cachedPlaneMeshRef);
+                        }
                     }
-                    else if (nY < -0.999f)
-                    {
-                        // Handle the edge case where the surface normal points exactly downwards.
-                        rotationAxis[0] = 1;
-                        rotationAxis[1] = 0;
-                        rotationAxis[2] = 0;
-                        Mat4f.Rotate(modelMatrix, modelMatrix, (float)Math.PI, rotationAxis);
-                    }
-
-                    // Upload the final transformation matrix to the shader and execute the draw call.
-                    prog.ModelMatrix = modelMatrix;
-                    capi.Render.RenderMesh(cachedPlaneMeshRef);
                 }
+
+                // If the entire frame rendered perfectly, clear the error counter
+                consecutiveErrors = 0;
             }
             catch (Exception e)
             {
-                capi.Logger.VerboseDebug($"[SlopeLib] Suppressed error during debug render: {e.Message}");
+                // Throttle log output to prevent severe I/O lag from continuous log spam
+                if (consecutiveErrors < 5)
+                {
+                    capi.Logger.VerboseDebug($"[SlopeLib] Suppressed error during debug render: {e.Message}");
+                    consecutiveErrors++;
+                }
             }
-
-            prog.Stop();
+            finally
+            {
+                // Guarantee the shader unbinds even if a severe thread exception occurs
+                prog.Stop();
+            }
         }
 
         /// <summary>
@@ -216,6 +251,7 @@ namespace oh3SlopeLib
         public void Dispose()
         {
             cachedPlaneMeshRef?.Dispose();
+            cachedPlaneMeshRef = null;
         }
     }
 }

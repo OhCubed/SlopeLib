@@ -17,6 +17,9 @@ namespace oh3SlopeLib
         private StringBuilder sb = new StringBuilder();
         private float updateTimer = 0f;
 
+        // --- Error state tracking to gracefully degrade without spamming logs ---
+        private int consecutiveErrors = 0;
+
         // Null prevents this dialog from capturing standard input keys like ESC or E
         public override string ToggleKeyCombinationCode => null;
 
@@ -33,7 +36,7 @@ namespace oh3SlopeLib
         private void SetupDialog()
         {
             // Position the logger cleanly in the top left, clear of central crosshairs.
-            ElementBounds dialogBounds = ElementBounds.Fixed(EnumDialogArea.LeftTop, 10, 10, 500, 50);
+            ElementBounds dialogBounds = ElementBounds.Fixed(EnumDialogArea.LeftTop, 10, 10, 550, 450);
 
             // Explicitly parent the bounds so ElementBounds.Fill knows what to constrain to
             ElementBounds bgBounds = ElementBounds.Fill;
@@ -62,41 +65,56 @@ namespace oh3SlopeLib
             // stale reference if the behavior is removed and re-added by the debug toggle command!
             behavior = capi?.World?.Player?.Entity?.GetBehavior<EntityBehaviorSlopeAware>();
 
-            if (behavior == null) return;
+            // Null-guards protect against partially initialized entities during chunk loading edges
+            if (behavior?.SurfaceDataList == null) return;
 
             try
             {
-                Vec3d normal = behavior.SurfaceNormal;
-                Vec3d point = behavior.SurfacePoint;
-
-                // Emulate the raycast to find the actual physical block underneath the projected point
-                Block physicalBlock = behavior.GetPhysicalSurfaceBlock(capi.World.BlockAccessor, point.X, point.Y, point.Z);
-
-                // Safe-navigation operators prevent exceptions if a block doesn't have a valid Code during chunk loading
-                string blockName = physicalBlock?.Code?.Path ?? "None";
-                string materialName = physicalBlock != null ? physicalBlock.BlockMaterial.ToString() : "None";
-
                 // Clear the builder and format everything in-place to ensure zero string orphan allocations
                 sb.Clear();
+                sb.AppendFormat("Tracked Spheres: {0}\n\n", behavior.SurfaceDataList.Length);
 
-                if (normal != null && point != null)
+                for (int s = 0; s < behavior.SurfaceDataList.Length; s++)
                 {
-                    sb.AppendFormat("Normal: [{0:F2}, {1:F2}, {2:F2}]  |  Point: [{3:F2}, {4:F2}, {5:F2}]\n", normal.X, normal.Y, normal.Z, point.X, point.Y, point.Z);
-                }
-                else
-                {
-                    sb.AppendLine("Normal: [None]  |  Point: [None]");
-                }
+                    var sd = behavior.SurfaceDataList[s];
+                    sb.AppendFormat("S{0} [Dia: {1:F1} | X/Y/Z Offsets: {2:F1}, {3:F1}, {4:F1}]\n", s, sd.CollisionSphereSize, sd.CollisionSphereXOffset, sd.CollisionSphereYOffset, sd.CollisionSphereZOffset);
 
-                sb.AppendFormat("Sphere Dia: {0:F2}  |  Y-Offset: {1:F2}  |  Dist To Plane: {2:F2}\n", behavior.CollisionSphereSize, behavior.CollisionSphereYOffset, behavior.DistanceToSurface);
-                sb.AppendFormat("Physical Block: {0}  |  Material: {1}", blockName, materialName);
+                    if (sd.Surfaces == null) continue;
+
+                    for (int i = 0; i < sd.Surfaces.Length; i++)
+                    {
+                        var surf = sd.Surfaces[i];
+                        if (surf == null || surf.DistanceToSurface > 9990.0)
+                        {
+                            sb.AppendFormat("  ► Surf {0}: [No Surface]\n", i);
+                            continue;
+                        }
+
+                        Block physicalBlock = behavior.GetPhysicalSurfaceBlock(capi.World.BlockAccessor, surf.SurfaceNormal, surf.SurfacePoint.X, surf.SurfacePoint.Y, surf.SurfacePoint.Z);
+
+                        // Safe-navigation operators prevent exceptions if a block doesn't have a valid Code during chunk loading
+                        string blockName = physicalBlock?.Code?.Path ?? "None";
+                        string materialName = physicalBlock != null ? physicalBlock.BlockMaterial.ToString() : "None";
+
+                        sb.AppendFormat("  ► Surf {0}: Norm: [{1:F2}, {2:F2}, {3:F2}] | Dist: {4:F2}\n", i, surf.SurfaceNormal.X, surf.SurfaceNormal.Y, surf.SurfaceNormal.Z, surf.DistanceToSurface);
+                        sb.AppendFormat("    Point: [{0:F2}, {1:F2}, {2:F2}] | Mat: {3} ({4})\n", surf.SurfacePoint.X, surf.SurfacePoint.Y, surf.SurfacePoint.Z, materialName, blockName);
+                    }
+                    sb.AppendLine(); // Spacing between spheres
+                }
 
                 SingleComposer.GetDynamicText("loggerText").SetNewText(sb.ToString());
+
+                // If the entire frame rendered perfectly, clear the error counter
+                consecutiveErrors = 0;
             }
             catch (Exception e)
             {
-                // Gracefully suppress exceptions during render passes so the client game doesn't hard-crash
-                capi.Logger.VerboseDebug($"[SlopeLib] Suppressed error in Debug HUD: {e.Message}");
+                // Throttle log output to prevent severe I/O lag from continuous log spam
+                if (consecutiveErrors < 5)
+                {
+                    capi.Logger.VerboseDebug($"[SlopeLib] Suppressed error in Debug HUD: {e.Message}");
+                    consecutiveErrors++;
+                }
             }
         }
 
@@ -105,6 +123,7 @@ namespace oh3SlopeLib
             base.Dispose();
             // Explicitly release Cairo font textures/buffers to prevent memory leaks across play sessions
             SingleComposer?.Dispose();
+            SingleComposer = null;
         }
     }
 }
