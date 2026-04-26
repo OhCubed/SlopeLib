@@ -12,45 +12,53 @@ namespace oh3SlopeLib
     /// </summary>
     public sealed class oh3SlopeLibModSystem : ModSystem
     {
+        // --- Core Client References ---
         private ICoreClientAPI capi;
         private SlopeDebugRenderer debugRenderer;
         private SlopeDebugHud debugHud;
 
         /// <summary>
-        /// Retrieves the active server-side configuration parameters.
+        /// Retrieves the active server-side configuration parameters (e.g., global physics toggles).
         /// </summary>
         public SlopeLibServerConfig ServerConfig { get; private set; }
 
         /// <summary>
-        /// Retrieves the active client-side configuration parameters.
+        /// Retrieves the active client-side configuration parameters (e.g., debug UI colors).
         /// </summary>
         public SlopeLibClientConfig ClientConfig { get; private set; }
 
         /// <summary>
-        /// The parsed, normalized color vector utilized by the debug shader.
+        /// The parsed, normalized color vector utilized by the debug shader. 
+        /// Represented as RGBA floats between 0.0 and 1.0.
         /// </summary>
         public Vec4f DebugColorVec { get; private set; } = new Vec4f(0f, 1f, 1f, 1f);
 
         /// <summary>
         /// Executed during the initial startup phase on both the client and the server.
+        /// Primarily used to register shared engine components like Entity Behaviors.
         /// </summary>
+        /// <param name="api">The unified core API provided by the engine.</param>
         public override void Start(ICoreAPI api)
         {
             base.Start(api);
 
-            // Register the custom slope-aware physics behavior with the engine's entity system.
+            // Register the custom slope-aware physics behavior with the engine's entity system
+            // so that it can be applied to entities via their JSON definitions.
             api.RegisterEntityBehaviorClass("slopeaware", typeof(EntityBehaviorSlopeAware));
         }
 
         /// <summary>
-        /// Executed during the server-side startup phase.
+        /// Executed exclusively during the server-side startup phase.
         /// </summary>
+        /// <param name="api">The server-specific API providing access to server configs and world generation.</param>
         public override void StartServerSide(ICoreServerAPI api)
         {
             base.StartServerSide(api);
 
             try
             {
+                // Attempt to deserialize the server configuration. If the file does not exist,
+                // fall back to a fresh instance and immediately serialize it to disk to create the template.
                 ServerConfig = api.LoadModConfig<SlopeLibServerConfig>("oh3SlopeLibServerConfig.json") ?? new SlopeLibServerConfig();
                 api.StoreModConfig(ServerConfig, "oh3SlopeLibServerConfig.json");
             }
@@ -62,8 +70,10 @@ namespace oh3SlopeLib
         }
 
         /// <summary>
-        /// Executed during the client-side startup phase.
+        /// Executed exclusively during the client-side startup phase.
+        /// Responsible for mounting UI components, rendering hooks, and client commands.
         /// </summary>
+        /// <param name="api">The client-specific API providing access to rendering, input, and GUI orchestration.</param>
         public override void StartClientSide(ICoreClientAPI api)
         {
             this.capi = api;
@@ -71,6 +81,7 @@ namespace oh3SlopeLib
 
             try
             {
+                // Attempt to deserialize the client configuration, generating a default file if necessary.
                 ClientConfig = api.LoadModConfig<SlopeLibClientConfig>("oh3SlopeLibClientConfig.json") ?? new SlopeLibClientConfig();
                 api.StoreModConfig(ClientConfig, "oh3SlopeLibClientConfig.json");
             }
@@ -82,12 +93,12 @@ namespace oh3SlopeLib
 
             ParseDebugColor();
 
-            // Initialize and register the debug rendering pipeline for the opaque pass.
-            // The ModSystem instance is passed to allow the renderer dynamic access to the parsed color vector.
+            // Initialize and register the debug rendering pipeline into the engine's opaque geometry pass.
+            // The ModSystem instance is passed down to allow the renderer dynamic access to the parsed color vector.
             debugRenderer = new SlopeDebugRenderer(api, this);
             api.Event.RegisterRenderer(debugRenderer, EnumRenderStage.Opaque, "slopedebug");
 
-            // Construct and register the interactive client-side developer command.
+            // Construct and register the interactive client-side developer command tree.
             api.ChatCommands.GetOrCreate("slopelib")
                 .WithDescription("SlopeLib client commands")
                 .BeginSubCommand("debug")
@@ -101,8 +112,10 @@ namespace oh3SlopeLib
         }
 
         /// <summary>
-        /// Translates the configured hex color string into a normalized Vec4f suitable for OpenGL shader consumption.
+        /// Translates the configured HTML hex color string (e.g., "#FF00FF") into a 
+        /// normalized OpenGL Vec4f suitable for immediate shader consumption.
         /// </summary>
+        /// <remarks>Gracefully falls back to a bright cyan (0, 1, 1, 1) if the string is malformed.</remarks>
         private void ParseDebugColor()
         {
             string hex = ClientConfig?.DebugColor?.TrimStart('#') ?? "00FFFF";
@@ -127,6 +140,8 @@ namespace oh3SlopeLib
         /// Handles the execution of the '/slopelib debug' chat command.
         /// Dynamically attaches or detaches the visualizer and evaluation behavior to the local player entity.
         /// </summary>
+        /// <param name="args">The parsed arguments provided by the user in the chat console.</param>
+        /// <returns>A command result dictating success or failure, outputted to the player's chat log.</returns>
         private TextCommandResult OnToggleDebug(TextCommandCallingArgs args)
         {
             if (debugRenderer == null) return TextCommandResult.Error("Debug renderer is not initialized.");
@@ -137,7 +152,7 @@ namespace oh3SlopeLib
             double yoffset = args[1] as double? ?? -9999.0;
             bool hasArgs = diameter > -9990.0;
 
-            // Enforce activation if explicit arguments are provided; otherwise, toggle the current state.
+            // Enforce activation if explicit arguments are provided; otherwise, toggle the current active state.
             if (hasArgs)
             {
                 debugRenderer.IsActive = true;
@@ -151,7 +166,7 @@ namespace oh3SlopeLib
 
             if (debugRenderer.IsActive)
             {
-                // Ensure the local player entity possesses the behavior necessary for testing.
+                // Ensure the local player entity possesses the behavior necessary for geometry testing.
                 var behavior = playerEntity.GetBehavior<EntityBehaviorSlopeAware>();
                 if (behavior == null)
                 {
@@ -159,7 +174,7 @@ namespace oh3SlopeLib
                     playerEntity.AddBehavior(behavior);
                 }
 
-                // Immediately apply explicit configurations to the active behavior instance.
+                // Immediately apply explicit configurations to the active behavior instance via the zero-allocation updater.
                 if (hasArgs)
                 {
                     if (behavior.SurfaceDataList != null && behavior.SurfaceDataList.Length > 0)
@@ -174,7 +189,7 @@ namespace oh3SlopeLib
                     }
                 }
 
-                // Mount the real-time HUD logger
+                // Mount and display the real-time HUD logger.
                 if (debugHud == null) debugHud = new SlopeDebugHud(capi, behavior);
                 debugHud.TryOpen();
 
@@ -185,14 +200,14 @@ namespace oh3SlopeLib
             }
             else
             {
-                // Cleanly detach the behavior to halt processing overhead when debug mode is inactive.
+                // Cleanly detach the behavior to entirely halt math processing overhead when debug mode is disabled.
                 var behavior = playerEntity.GetBehavior<EntityBehaviorSlopeAware>();
                 if (behavior != null)
                 {
                     playerEntity.RemoveBehavior(behavior);
                 }
 
-                // Unmount the logger
+                // Unmount and hide the HUD logger.
                 debugHud?.TryClose();
             }
 
@@ -201,11 +216,13 @@ namespace oh3SlopeLib
 
         /// <summary>
         /// Executed when the mod is unloaded or the client disconnects.
+        /// Responsible for freeing unmanaged memory and wiping static caches.
         /// </summary>
         public override void Dispose()
         {
             base.Dispose();
 
+            // Destroy the HUD dialog to free Cairo font textures and UI buffers.
             debugHud?.Dispose();
             debugHud = null;
 
@@ -214,7 +231,7 @@ namespace oh3SlopeLib
             debugRenderer?.Dispose();
             debugRenderer = null;
 
-            // Flush the expression tree delegates to prevent static Type leaking across worlds.
+            // Flush the compiled expression tree delegates to prevent static types from leaking across world reloads.
             MaterialUtility.ClearCache();
         }
     }

@@ -7,27 +7,59 @@ using Vintagestory.API.MathTools;
 namespace oh3SlopeLib
 {
     /// <summary>
-    /// Holds the normal, distance, and coordinate for a single evaluated surface plane.
+    /// Represents the mathematical evaluation of a single distinct surface plane detected near a collision sphere.
     /// </summary>
     public class TrackedSurface
     {
+        /// <summary>
+        /// The orthogonal normal vector of the evaluated surface plane.
+        /// </summary>
         public Vec3d SurfaceNormal { get; set; } = new Vec3d(0, 1, 0);
+
+        /// <summary>
+        /// The shortest distance from the exterior edge of the collision sphere to this surface plane.
+        /// </summary>
         public double DistanceToSurface { get; set; } = 9999.0;
+
+        /// <summary>
+        /// The exact coordinate in world space where the surface plane was detected.
+        /// </summary>
         public Vec3d SurfacePoint { get; set; } = new Vec3d(0, 0, 0);
     }
 
     /// <summary>
-    /// Holds the mathematical state of a single virtual sampling sphere and its resulting surface data.
+    /// Holds the geometric configuration of a single virtual sampling sphere and its resulting surface evaluation data.
     /// </summary>
     public class SurfaceData
     {
+        /// <summary>
+        /// A pre-allocated array of the 4 closest, distinctly separate surface planes detected near this sphere.
+        /// </summary>
         public TrackedSurface[] Surfaces { get; private set; }
 
+        /// <summary>
+        /// The physical diameter of the sampling sphere in blocks/meters.
+        /// </summary>
         public double CollisionSphereSize { get; set; } = 1.0;
+
+        /// <summary>
+        /// The X-axis offset of the sphere relative to the entity's center, before yaw rotation is applied.
+        /// </summary>
         public double CollisionSphereXOffset { get; set; } = 0.0;
+
+        /// <summary>
+        /// The Y-axis (vertical) offset of the sphere relative to the entity's center.
+        /// </summary>
         public double CollisionSphereYOffset { get; set; } = 0.5;
+
+        /// <summary>
+        /// The Z-axis offset of the sphere relative to the entity's center, before yaw rotation is applied.
+        /// </summary>
         public double CollisionSphereZOffset { get; set; } = 0.0;
 
+        /// <summary>
+        /// Initializes a new instance of the <see cref="SurfaceData"/> class and pre-allocates surface tracking memory.
+        /// </summary>
         public SurfaceData()
         {
             Surfaces = new TrackedSurface[4];
@@ -36,32 +68,40 @@ namespace oh3SlopeLib
     }
 
     /// <summary>
-    /// Extends entity physics by generating a dynamically interpolated surface normal and distance metric.
+    /// Extends entity physics by generating dynamically interpolated surface normals and distance metrics.
+    /// Designed with strict zero-allocation (GC-free) hot paths for maximum runtime performance.
     /// </summary>
     public class EntityBehaviorSlopeAware : EntityBehavior
     {
         /// <summary>
-        /// The tracked surface properties and geometric configuration for this entity.
+        /// The collection of surface properties and geometric configurations tracked for this entity.
         /// </summary>
         public SurfaceData[] SurfaceDataList { get; set; } = new SurfaceData[] { new SurfaceData() };
 
         // --- Execution Control ---
+
+        /// <summary>The entity's coordinate during the last successful surface evaluation.</summary>
         private Vec3d lastSampledPos = new Vec3d(0, -9999, 0);
+        /// <summary>The entity's yaw rotation during the last successful surface evaluation.</summary>
         private double lastSampledYaw = -999.0;
 
-        // --- Error state tracking to gracefully degrade without spamming logs ---
-        private int consecutiveTickErrors = 0;
-        private int consecutiveRaycastErrors = 0;
-
         /// <summary>
-        /// The squared distance or angular delta the entity must move before triggering a new geometric evaluation. 
+        /// The squared distance the entity must move before triggering a new geometric evaluation. 
         /// Prevents unnecessary mathematical overhead when standing still.
         /// </summary>
         private const double SampleThresholdSq = 0.1 * 0.1;
+
+        /// <summary>
+        /// The angular delta (in radians) the entity must rotate before triggering a new geometric evaluation.
+        /// </summary>
         private const double SampleYawThreshold = 0.05;
 
+        // --- Error State Tracking ---
+        private int consecutiveTickErrors = 0;
+        private int consecutiveRaycastErrors = 0;
+
         // --- Pre-allocated Buffers (Zero-Allocation Physics Design) ---
-        // These buffers prevent Garbage Collection (GC) spikes during hot-path execution.
+        // These buffers prevent Garbage Collection (GC) spikes during the physics tick loop.
         private BlockPos minPos = new BlockPos();
         private BlockPos maxPos = new BlockPos();
         private BlockPos tmpPos = new BlockPos();
@@ -71,7 +111,7 @@ namespace oh3SlopeLib
 
         /// <summary>
         /// A lightweight, struct-based Axis-Aligned Bounding Box (AABB) representation 
-        /// used to flatten proximal collision data for rapid traversal.
+        /// used to flatten proximal collision data for rapid, memory-contiguous traversal.
         /// </summary>
         private struct FastAABB
         {
@@ -91,11 +131,14 @@ namespace oh3SlopeLib
         private double avgNormX, avgNormY, avgNormZ;
         private Action<Block, int, int, int> walkBlocksDelegate;
 
-        // Adjacency cache to minimize chunk data access overhead per block iteration.
+        // Adjacency cache to minimize chunk dictionary lookup overhead during block iteration.
         private Block[] neighborBlocks = new Block[6];
         private bool[] neighborBlocksFetched = new bool[6];
 
-        // Track the faces that have already served as the primary anchor in previous evaluation passes
+        /// <summary>
+        /// Tracks faces that served as the primary anchor in previous evaluation passes,
+        /// ensuring each pass detects a distinctly separate geometric plane.
+        /// </summary>
         private struct ExcludedFace
         {
             public double pX, pY, pZ;
@@ -114,16 +157,24 @@ namespace oh3SlopeLib
         }
 
         /// <summary>
-        /// The unique registry name for this behavior.
+        /// The unique registry string identifier for this behavior.
         /// </summary>
+        /// <returns>The string "slopeaware".</returns>
         public override string PropertyName() => "slopeaware";
 
         /// <summary>
         /// Called when the entity is initialized. Resolves configuration parameters from either global entity attributes or behavior-specific properties.
         /// </summary>
+        /// <param name="properties">The entity's type properties.</param>
+        /// <param name="attributes">The specific JSON attributes attached to this behavior instance.</param>
+        /// <remarks>
+        /// Supports both legacy single-sphere JSON syntax and the modern JSON array syntax for multi-sphere setups.
+        /// </remarks>
         public override void Initialize(EntityProperties properties, JsonObject attributes)
         {
             base.Initialize(properties, attributes);
+
+            if (SurfaceDataList == null) SurfaceDataList = new SurfaceData[] { new SurfaceData() };
 
             JsonObject behaviorConfig = null;
 
@@ -171,6 +222,11 @@ namespace oh3SlopeLib
         /// <summary>
         /// Dynamically updates the geometric configuration of a specific sampling sphere without requiring memory reallocation.
         /// </summary>
+        /// <param name="index">The array index of the sphere to update.</param>
+        /// <param name="size">The new physical diameter of the sphere.</param>
+        /// <param name="xOffset">The new X-axis local offset.</param>
+        /// <param name="yOffset">The new Y-axis local offset.</param>
+        /// <param name="zOffset">The new Z-axis local offset.</param>
         public void UpdateSphereConfig(int index, double size, double xOffset, double yOffset, double zOffset)
         {
             if (SurfaceDataList != null && index >= 0 && index < SurfaceDataList.Length)
@@ -182,6 +238,11 @@ namespace oh3SlopeLib
             }
         }
 
+        /// <summary>
+        /// Applies JSON configuration values to a target <see cref="SurfaceData"/> object.
+        /// </summary>
+        /// <param name="data">The surface data object to populate.</param>
+        /// <param name="config">The JSON object containing the properties.</param>
         private void ParseSurfaceDataConfig(SurfaceData data, JsonObject config)
         {
             data.CollisionSphereSize = config["diameter"]?.AsDouble(1.0) ?? 1.0;
@@ -193,6 +254,7 @@ namespace oh3SlopeLib
         /// <summary>
         /// Called during the main engine loop. Responsible for conditionally triggering terrain evaluation.
         /// </summary>
+        /// <param name="deltaTime">The time elapsed since the last tick.</param>
         public override void OnGameTick(float deltaTime)
         {
             base.OnGameTick(deltaTime);
@@ -234,9 +296,11 @@ namespace oh3SlopeLib
         }
 
         /// <summary>
-        /// Core evaluation routine. Executes a two-pass algorithm:
-        /// 1. Flattens proximal block collision boundaries into a contiguous buffer.
-        /// 2. Iterates faces, applying occlusion culling and inverse-square proximity weighting to resolve a unified surface normal.
+        /// Core evaluation routine. Executes a multiphase algorithm:
+        /// 1. Determines the bounding volume covering all configured spheres.
+        /// 2. Flattens proximal block collision boundaries within that volume into a contiguous struct buffer.
+        /// 3. Iterates 4 passes per sphere, applying occlusion culling, proximity weighting, and coplanar 
+        ///    exclusion to resolve the 4 nearest mathematically distinct surface planes.
         /// </summary>
         private void UpdateSurfaceData()
         {
@@ -258,6 +322,7 @@ namespace oh3SlopeLib
                 var sd = SurfaceDataList[s];
                 double sRad = sd.CollisionSphereSize / 2.0;
 
+                // Translate the sphere's local offsets into world space based on the entity's yaw rotation
                 double cX = entX + (sd.CollisionSphereXOffset * cosYaw - sd.CollisionSphereZOffset * sinYaw);
                 double cY = entY + sd.CollisionSphereYOffset;
                 double cZ = entZ + (sd.CollisionSphereXOffset * sinYaw + sd.CollisionSphereZOffset * cosYaw);
@@ -275,6 +340,8 @@ namespace oh3SlopeLib
             maxPos.Set((int)Math.Ceiling(maxX), (int)Math.Ceiling(maxY), (int)Math.Ceiling(maxZ));
 
             localBoxCount = 0;
+
+            // Execute the world query strictly once, dumping all geometry into our local struct cache
             entity.World.BlockAccessor.WalkBlocks(minPos, maxPos, walkBlocksDelegate);
 
             BlockFacing[] facings = BlockFacing.ALLFACES;
@@ -292,6 +359,7 @@ namespace oh3SlopeLib
                     entZ + (sd.CollisionSphereXOffset * sinYaw + sd.CollisionSphereZOffset * cosYaw)
                 );
 
+                // Run 4 distinct evaluation passes to find the top 4 geometric layers
                 for (int pass = 0; pass < 4; pass++)
                 {
                     avgNormX = 0; avgNormY = 0; avgNormZ = 0;
@@ -322,7 +390,7 @@ namespace oh3SlopeLib
 
                             bool isExposed = true;
 
-                            // Evaluate surface exposure. Concealed faces are culled to prevent internal geometry from skewing the normal.
+                            // Evaluate surface exposure. Concealed interior faces are culled to prevent internal geometry from skewing the normal.
                             if (facing == BlockFacing.UP && box.y2 - box.by >= 0.999)
                                 isExposed = !GetNeighbor(BlockFacing.UP, box.bx, box.by, box.bz, ba).SideSolid[BlockFacing.DOWN.Index];
                             else if (facing == BlockFacing.DOWN && box.y1 - box.by <= 0.001)
@@ -344,7 +412,7 @@ namespace oh3SlopeLib
                             double pY = center.Y < box.y1 ? box.y1 : (center.Y > box.y2 ? box.y2 : center.Y);
                             double pZ = center.Z < box.z1 ? box.z1 : (center.Z > box.z2 ? box.z2 : center.Z);
 
-                            // Snap to the plane of the face.
+                            // Snap the projected point exactly to the plane of the face.
                             if (facing == BlockFacing.UP) pY = box.y2;
                             else if (facing == BlockFacing.DOWN) pY = box.y1;
                             else if (facing == BlockFacing.NORTH) pZ = box.z1;
@@ -352,17 +420,19 @@ namespace oh3SlopeLib
                             else if (facing == BlockFacing.WEST) pX = box.x1;
                             else if (facing == BlockFacing.EAST) pX = box.x2;
 
-                            // Skip this block face if it lies on the exact same continuous plane as a previous pass's anchor
+                            // Coplanar Exclusion: Skip this block face if it lies on the exact same continuous plane 
+                            // (like a long wall) as an anchor from a previously completed pass.
                             bool isExcluded = false;
                             for (int ex = 0; ex < pass; ex++)
                             {
                                 if (excludedFaces[ex].faceIndex == facing.Index)
                                 {
+                                    // Get the vector between the current point and the previously excluded anchor point
                                     double vecX = pX - excludedFaces[ex].pX;
                                     double vecY = pY - excludedFaces[ex].pY;
                                     double vecZ = pZ - excludedFaces[ex].pZ;
 
-                                    // Evaluates to 0.0 if the current point lies perfectly flat along the excluded normal's plane
+                                    // Project that vector against the normal. If the result is near zero, the points are coplanar.
                                     double dotPlane = Math.Abs(vecX * facing.Normali.X + vecY * facing.Normali.Y + vecZ * facing.Normali.Z);
 
                                     if (dotPlane < 0.01)
@@ -379,11 +449,11 @@ namespace oh3SlopeLib
                             double dirY = center.Y - pY;
                             double dirZ = center.Z - pZ;
 
-                            // Discard faces oriented away from the sampling origin.
+                            // Discard faces oriented away from the sampling origin (backface culling).
                             double dot = dirX * facing.Normali.X + dirY * facing.Normali.Y + dirZ * facing.Normali.Z;
                             if (dot <= 0.0001) continue;
 
-                            // Skip TrackedSurfaces whose calculated infinite plane distance is physically closer 
+                            // Monotonicity Check: Skip faces whose calculated infinite plane distance is physically closer 
                             // to our sphere center than the previous closest tracked face.
                             // A tiny epsilon prevents floating-point inaccuracies from falsely culling equidistant symmetric faces.
                             if (pass > 0)
@@ -404,6 +474,7 @@ namespace oh3SlopeLib
                             double distToEdgeSq = distToEdge * distToEdge;
 
                             // Execute line-of-sight occlusion validation against the pre-compiled AABB collection.
+                            // If geometry is obstructing our view of this face, ignore it.
                             if (distToCenterSq > 0.01)
                             {
                                 if (IsOccluded(center.X, center.Y, center.Z, pX, pY, pZ, b)) continue;
@@ -465,7 +536,7 @@ namespace oh3SlopeLib
                             center.Z - sd.Surfaces[pass].SurfaceNormal.Z * distCenterToPlane
                         );
 
-                        // Add the closest face to the exclusion list for the next loop iteration
+                        // Add the closest face to the exclusion list for the next pass
                         excludedFaces[pass].pX = bestPx;
                         excludedFaces[pass].pY = bestPy;
                         excludedFaces[pass].pZ = bestPz;
@@ -473,7 +544,7 @@ namespace oh3SlopeLib
                     }
                     else
                     {
-                        // Default fallback state for unconstrained airspace. Break remaining passes.
+                        // Default fallback state for unconstrained airspace. Early-out remaining passes.
                         for (int r = pass; r < 4; r++)
                         {
                             sd.Surfaces[r].SurfaceNormal.Set(0, 1, 0);
@@ -610,6 +681,14 @@ namespace oh3SlopeLib
         /// Emulates a zero-allocation raycast along the inverted surface normal to find the physical block 
         /// backing the mathematical plane.
         /// </summary>
+        /// <param name="blockAccessor">The world block accessor.</param>
+        /// <param name="normal">The evaluated normal vector to cast against.</param>
+        /// <param name="pX">The origin X coordinate.</param>
+        /// <param name="pY">The origin Y coordinate.</param>
+        /// <param name="pZ">The origin Z coordinate.</param>
+        /// <param name="maxDepth">The maximum physical penetration depth of the raycast.</param>
+        /// <returns>The physical backing Block, or null if unresolvable.</returns>
+        /// <remarks>Steps into the plane mathematically in fixed increments to ensure proper hit detection on partial blocks.</remarks>
         public Block GetPhysicalSurfaceBlock(IBlockAccessor blockAccessor, Vec3d normal, double pX, double pY, double pZ, double maxDepth = 0.8)
         {
             if (normal == null || blockAccessor == null) return null;
