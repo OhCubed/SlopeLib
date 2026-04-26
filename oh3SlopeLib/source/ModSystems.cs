@@ -14,6 +14,7 @@ namespace oh3SlopeLib
     {
         private ICoreClientAPI capi;
         private SlopeDebugRenderer debugRenderer;
+        private SlopeDebugHud debugHud;
 
         /// <summary>
         /// Retrieves the active server-side configuration parameters.
@@ -163,7 +164,14 @@ namespace oh3SlopeLib
                 {
                     behavior.CollisionSphereSize = diameter;
                     behavior.CollisionSphereYOffset = yoffset > -9990.0 ? yoffset : (diameter / 2.0);
+                }
 
+                // Mount the real-time HUD logger
+                if (debugHud == null) debugHud = new SlopeDebugHud(capi, behavior);
+                debugHud.TryOpen();
+
+                if (hasArgs)
+                {
                     return TextCommandResult.Success($"SlopeLib debug view is now ON (Diameter: {behavior.CollisionSphereSize}, Y-Offset: {behavior.CollisionSphereYOffset}).");
                 }
             }
@@ -175,6 +183,9 @@ namespace oh3SlopeLib
                 {
                     playerEntity.RemoveBehavior(behavior);
                 }
+
+                // Unmount the logger
+                debugHud?.TryClose();
             }
 
             return TextCommandResult.Success($"SlopeLib debug view is now {(debugRenderer.IsActive ? "ON" : "OFF")}.");
@@ -187,10 +198,16 @@ namespace oh3SlopeLib
         {
             base.Dispose();
 
+            debugHud?.Dispose();
+            debugHud = null;
+
             // CRITICAL OPTIMIZATION: We must dispose of our OpenGL MeshRef when the mod unloads 
             // to prevent VRAM memory leaks every time the player disconnects and reconnects.
             debugRenderer?.Dispose();
             debugRenderer = null;
+
+            // Flush the expression tree delegates to prevent static Type leaking across worlds.
+            MaterialUtility.ClearCache();
         }
     }
 }

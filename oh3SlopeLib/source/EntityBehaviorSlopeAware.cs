@@ -8,13 +8,12 @@ namespace oh3SlopeLib
 {
     /// <summary>
     /// Extends entity physics by generating a dynamically interpolated surface normal and distance metric.
-    /// Utilizes a virtual sampling sphere to aggregate surrounding block geometry, enabling advanced 
-    /// surface-aligned mechanics such as rolling, sliding, or custom IK adaptations.
     /// </summary>
     public class EntityBehaviorSlopeAware : EntityBehavior
     {
         /// <summary>
         /// The normalized, mathematically averaged vector representing the orientation of the surrounding terrain.
+        /// Defaults to straight up (0, 1, 0) when in mid-air.
         /// </summary>
         public Vec3d SurfaceNormal { get; private set; } = new Vec3d(0, 1, 0);
 
@@ -38,21 +37,34 @@ namespace oh3SlopeLib
         /// </summary>
         public Vec3d SurfacePoint { get; private set; } = new Vec3d(0, 0, 0);
 
+        // --- Execution Control ---
         private Vec3d lastSampledPos = new Vec3d(0, -9999, 0);
+
+        /// <summary>
+        /// The squared distance the entity must move before triggering a new geometric evaluation. 
+        /// Prevents unnecessary mathematical overhead when the entity is standing still.
+        /// </summary>
         private const double SampleThresholdSq = 0.1 * 0.1;
 
-        // Pre-allocated buffers to minimize Garbage Collection overhead during hot-path execution.
+        // --- Pre-allocated Buffers (Zero-Allocation Physics Design) ---
+        // These buffers prevent Garbage Collection (GC) spikes during hot-path execution.
         private BlockPos minPos = new BlockPos();
         private BlockPos maxPos = new BlockPos();
         private BlockPos tmpPos = new BlockPos();
+        private BlockPos raycastPos = new BlockPos();
         private Vec3d center = new Vec3d();
         private Vec3d averageNormal = new Vec3d();
 
+        /// <summary>
+        /// A lightweight, struct-based Axis-Aligned Bounding Box (AABB) representation 
+        /// used to flatten proximal collision data for rapid traversal.
+        /// </summary>
         private struct FastAABB
         {
             public double x1, y1, z1, x2, y2, z2;
             public int bx, by, bz;
         }
+
         private FastAABB[] localBoxes = new FastAABB[512];
         private int localBoxCount = 0;
 
@@ -60,29 +72,33 @@ namespace oh3SlopeLib
         private double sphereRadius;
         private double minDistanceToEdge;
         private int facesSampled;
-        private double closestX;
-        private double closestY;
-        private double closestZ;
-        private double closestNormX;
-        private double closestNormY;
-        private double closestNormZ;
-        private double avgNormX;
-        private double avgNormY;
-        private double avgNormZ;
+        private double closestX, closestY, closestZ;
+        private double closestNormX, closestNormY, closestNormZ;
+        private double avgNormX, avgNormY, avgNormZ;
         private Action<Block, int, int, int> walkBlocksDelegate;
 
         // Adjacency cache to minimize chunk data access overhead per block iteration.
         private Block[] neighborBlocks = new Block[6];
         private bool[] neighborBlocksFetched = new bool[6];
 
+        /// <summary>
+        /// Initializes a new instance of the <see cref="EntityBehaviorSlopeAware"/> class.
+        /// </summary>
+        /// <param name="entity">The entity this behavior is attached to.</param>
         public EntityBehaviorSlopeAware(Entity entity) : base(entity)
         {
-            // Cache the delegate once during initialization to prevent implicit heap allocations.
+            // Cache the delegate once during initialization to prevent implicit heap allocations on every frame.
             walkBlocksDelegate = OnBlockWalked;
         }
 
+        /// <summary>
+        /// The unique registry name for this behavior.
+        /// </summary>
         public override string PropertyName() => "slopeaware";
 
+        /// <summary>
+        /// Called when the entity is initialized. Resolves configuration parameters from either global entity attributes or behavior-specific properties.
+        /// </summary>
         public override void Initialize(EntityProperties properties, JsonObject attributes)
         {
             base.Initialize(properties, attributes);
@@ -99,7 +115,7 @@ namespace oh3SlopeLib
             {
                 slopelibConfig = attributes["slopelib"];
             }
-            // 3. Fall back to the behavior's attributes directly if no "slopelib" wrapper was used
+            // Fall back to the behavior's attributes directly if no "slopelib" wrapper was used.
             else if (attributes != null && (attributes.KeyExists("diameter") || attributes.KeyExists("yoffset")))
             {
                 slopelibConfig = attributes;
@@ -118,6 +134,9 @@ namespace oh3SlopeLib
             }
         }
 
+        /// <summary>
+        /// Called during the main engine loop. Responsible for conditionally triggering terrain evaluation.
+        /// </summary>
         public override void OnGameTick(float deltaTime)
         {
             base.OnGameTick(deltaTime);
@@ -127,11 +146,13 @@ namespace oh3SlopeLib
 
             try
             {
-                // Calculate delta manually to prevent implicit Vec3d allocations from property getters.
+                // Calculate movement delta manually to prevent implicit Vec3d allocations from property getters.
                 double dx = entity.Pos.X - lastSampledPos.X;
                 double dy = entity.Pos.Y - lastSampledPos.Y;
                 double dz = entity.Pos.Z - lastSampledPos.Z;
 
+                // Optimization: Skip heavy intersection math if the entity hasn't moved significantly.
+                // NOTE: Rotation-only entities (like stationary turrets) won't trigger an update under this logic.
                 if (dx * dx + dy * dy + dz * dz < SampleThresholdSq)
                 {
                     return;
@@ -143,7 +164,7 @@ namespace oh3SlopeLib
             }
             catch (Exception e)
             {
-                // Suppress transient geometry resolution errors to maintain simulation stability.
+                // Suppress transient geometry resolution errors (e.g. unloaded chunks) to maintain simulation stability.
                 entity.World.Logger.VerboseDebug($"[SlopeLib] Suppressed error in EntityBehaviorSlopeAware: {e.Message}");
             }
         }
@@ -164,22 +185,16 @@ namespace oh3SlopeLib
                 entity.Pos.Z
             );
 
-            // Re-use pre-allocated block positions
+            // Re-use pre-allocated block positions to define the spatial bounds of our query.
             minPos.Set((int)Math.Floor(center.X - sphereRadius - 1.0), (int)Math.Floor(center.Y - sphereRadius - 1.0), (int)Math.Floor(center.Z - sphereRadius - 1.0));
             maxPos.Set((int)Math.Ceiling(center.X + sphereRadius + 1.0), (int)Math.Ceiling(center.Y + sphereRadius + 1.0), (int)Math.Ceiling(center.Z + sphereRadius + 1.0));
 
-            // Reset loop counters
-            avgNormX = 0;
-            avgNormY = 0;
-            avgNormZ = 0;
-            closestNormX = 0;
-            closestNormY = 1;
-            closestNormZ = 0;
+            // Reset loop counters and accumulators.
+            avgNormX = 0; avgNormY = 0; avgNormZ = 0;
+            closestNormX = 0; closestNormY = 1; closestNormZ = 0;
             minDistanceToEdge = 9999.0;
             facesSampled = 0;
-            closestX = center.X;
-            closestY = center.Y;
-            closestZ = center.Z;
+            closestX = center.X; closestY = center.Y; closestZ = center.Z;
             localBoxCount = 0;
 
             // Phase 1: Populate the local collision bounds array via spatial traversal.
@@ -189,6 +204,7 @@ namespace oh3SlopeLib
             IBlockAccessor ba = entity.World.BlockAccessor;
             int lastBx = -999, lastBy = -999, lastBz = -999;
 
+            // Phase 2: Iterate all flattened AABBs and evaluate their faces against the sampling sphere.
             for (int b = 0; b < localBoxCount; b++)
             {
                 ref FastAABB box = ref localBoxes[b];
@@ -197,18 +213,15 @@ namespace oh3SlopeLib
                 if (box.bx != lastBx || box.by != lastBy || box.bz != lastBz)
                 {
                     for (int i = 0; i < 6; i++) neighborBlocksFetched[i] = false;
-                    lastBx = box.bx;
-                    lastBy = box.by;
-                    lastBz = box.bz;
+                    lastBx = box.bx; lastBy = box.by; lastBz = box.bz;
                 }
 
                 for (int j = 0; j < facings.Length; j++)
                 {
                     BlockFacing facing = facings[j];
-
-                    // Evaluate surface exposure. Concealed faces are culled to prevent internal geometry from skewing the normal.
                     bool isExposed = true;
 
+                    // Evaluate surface exposure. Concealed faces are culled to prevent internal geometry from skewing the normal.
                     if (facing == BlockFacing.UP && box.y2 - box.by >= 0.999)
                         isExposed = !GetNeighbor(BlockFacing.UP, box.bx, box.by, box.bz, ba).SideSolid[BlockFacing.DOWN.Index];
                     else if (facing == BlockFacing.DOWN && box.y1 - box.by <= 0.001)
@@ -230,7 +243,7 @@ namespace oh3SlopeLib
                     double pY = center.Y < box.y1 ? box.y1 : (center.Y > box.y2 ? box.y2 : center.Y);
                     double pZ = center.Z < box.z1 ? box.z1 : (center.Z > box.z2 ? box.z2 : center.Z);
 
-                    // Snap to the plane of the face
+                    // Snap to the plane of the face.
                     if (facing == BlockFacing.UP) pY = box.y2;
                     else if (facing == BlockFacing.DOWN) pY = box.y1;
                     else if (facing == BlockFacing.NORTH) pZ = box.z1;
@@ -265,9 +278,7 @@ namespace oh3SlopeLib
                     if (distToEdge < minDistanceToEdge)
                     {
                         minDistanceToEdge = distToEdge;
-                        closestX = pX;
-                        closestY = pY;
-                        closestZ = pZ;
+                        closestX = pX; closestY = pY; closestZ = pZ;
                         closestNormX = facing.Normali.X;
                         closestNormY = facing.Normali.Y;
                         closestNormZ = facing.Normali.Z;
@@ -287,10 +298,10 @@ namespace oh3SlopeLib
 
             averageNormal.Set(avgNormX, avgNormY, avgNormZ);
 
-            // Phase 2: Normalize the accumulated weights to establish the final interpolated surface plane.
+            // Phase 3: Normalize the accumulated weights to establish the final interpolated surface plane.
             if (facesSampled > 0)
             {
-                // Handle symmetrical cancellation (e.g., wedged between parallel walls) by falling back to the nearest absolute face normal.
+                // Handle symmetrical cancellation (e.g., wedged tightly between parallel walls) by falling back to the nearest absolute face normal.
                 if (averageNormal.LengthSq() > 0.001)
                 {
                     averageNormal.Normalize();
@@ -320,7 +331,7 @@ namespace oh3SlopeLib
             }
             else
             {
-                // Default state for unconstrained airspace.
+                // Default fallback state for unconstrained airspace.
                 SurfaceNormal.Set(0, 1, 0);
                 DistanceToSurface = 9999.0;
                 SurfacePoint.Set(center.X, center.Y - sphereRadius, center.Z);
@@ -331,6 +342,10 @@ namespace oh3SlopeLib
         /// Spatial query callback. Flattens world-space collision boxes into a pre-allocated stack buffer 
         /// to decouple geometric evaluation from chunk map query latency.
         /// </summary>
+        /// <param name="block">The block found at the coordinates.</param>
+        /// <param name="bx">Block X position.</param>
+        /// <param name="by">Block Y position.</param>
+        /// <param name="bz">Block Z position.</param>
         private void OnBlockWalked(Block block, int bx, int by, int bz)
         {
             if (block.Id == 0) return;
@@ -343,6 +358,7 @@ namespace oh3SlopeLib
             {
                 // Enforce a hard capacity limit to prevent buffer overruns from excessively detailed block geometries.
                 if (localBoxCount >= 512) break;
+
                 Cuboidf box = boxes[i];
                 localBoxes[localBoxCount].x1 = bx + box.X1;
                 localBoxes[localBoxCount].y1 = by + box.Y1;
@@ -353,6 +369,7 @@ namespace oh3SlopeLib
                 localBoxes[localBoxCount].bx = bx;
                 localBoxes[localBoxCount].by = by;
                 localBoxes[localBoxCount].bz = bz;
+
                 localBoxCount++;
             }
         }
@@ -401,7 +418,10 @@ namespace oh3SlopeLib
                 double tmin = 0.0;
                 double tmax = maxT;
 
-                if (dirX > -0.000001 && dirX < 0.000001) { if (startX < box.x1 || startX > box.x2) continue; }
+                if (dirX > -0.000001 && dirX < 0.000001)
+                {
+                    if (startX < box.x1 || startX > box.x2) continue;
+                }
                 else
                 {
                     double ood = 1.0 / dirX;
@@ -419,6 +439,15 @@ namespace oh3SlopeLib
             return false;
         }
 
+        /// <summary>
+        /// Retrieves an adjacent block utilizing a specialized local cache to minimize chunk dictionary lookups.
+        /// </summary>
+        /// <param name="face">The direction of the adjacent block relative to the origin block.</param>
+        /// <param name="bx">The origin block X coordinate.</param>
+        /// <param name="by">The origin block Y coordinate.</param>
+        /// <param name="bz">The origin block Z coordinate.</param>
+        /// <param name="ba">The active block accessor.</param>
+        /// <returns>The block instance residing at the requested neighboring coordinate.</returns>
         private Block GetNeighbor(BlockFacing face, int bx, int by, int bz, IBlockAccessor ba)
         {
             int idx = face.Index;
@@ -426,6 +455,74 @@ namespace oh3SlopeLib
             neighborBlocks[idx] = ba.GetBlock(bx + face.Normali.X, by + face.Normali.Y, bz + face.Normali.Z);
             neighborBlocksFetched[idx] = true;
             return neighborBlocks[idx];
+        }
+
+        /// <summary>
+        /// Emulates a zero-allocation raycast along the inverted surface normal to find the physical block 
+        /// backing the mathematical plane.
+        /// </summary>
+        public Block GetPhysicalSurfaceBlock(IBlockAccessor blockAccessor, double pX, double pY, double pZ, double maxDepth = 0.8)
+        {
+            Vec3d normal = this.SurfaceNormal;
+            if (normal == null || blockAccessor == null) return null;
+
+            try
+            {
+                // Step into the plane mathematically in fixed increments.
+                for (double d = 0.2; d <= maxDepth + 0.01; d += 0.2)
+                {
+                    double cX = pX - normal.X * d;
+                    double cY = pY - normal.Y * d;
+                    double cZ = pZ - normal.Z * d;
+
+                    raycastPos.Set(
+                        (int)Math.Floor(cX),
+                        (int)Math.Floor(cY),
+                        (int)Math.Floor(cZ)
+                    );
+
+                    Block block = blockAccessor.GetBlock(raycastPos);
+
+                    if (block == null || block.Id == 0) continue;
+
+                    // Ensure the target block actually contains active collision bounds.
+                    if (block.CollisionBoxes != null && block.CollisionBoxes.Length > 0)
+                    {
+                        bool intersects = false;
+
+                        // Calculate local coordinates within the block's grid space to verify partial blocks (e.g., slabs).
+                        double localX = cX - raycastPos.X;
+                        double localY = cY - raycastPos.Y;
+                        double localZ = cZ - raycastPos.Z;
+
+                        // Iterate and verify the raycast actually hits the active bounds of partial blocks.
+                        for (int i = 0; i < block.CollisionBoxes.Length; i++)
+                        {
+                            Cuboidf box = block.CollisionBoxes[i];
+                            if (localX >= box.X1 && localX <= box.X2 &&
+                                localY >= box.Y1 && localY <= box.Y2 &&
+                                localZ >= box.Z1 && localZ <= box.Z2)
+                            {
+                                intersects = true;
+                                break;
+                            }
+                        }
+
+                        if (intersects)
+                        {
+                            // Defer to the unified utility for Microblock extraction, returning the true backing material.
+                            return MaterialUtility.GetMaterialBlock(blockAccessor, block, raycastPos);
+                        }
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                // Soft-fail on chunk boundaries or corrupted voxel data to prevent physics ticks from halting.
+                entity?.World?.Logger.VerboseDebug($"[SlopeLib] Suppressed error during surface block raycast: {e.Message}");
+            }
+
+            return null;
         }
     }
 }
